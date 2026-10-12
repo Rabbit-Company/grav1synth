@@ -4,6 +4,8 @@ use std::ops::{Add, AddAssign};
 
 use anyhow::anyhow;
 use arrayvec::ArrayVec;
+use rayon::ThreadPool;
+use rayon::prelude::*;
 use v_frame::{chroma::ChromaSubsampling, frame::Frame, plane::Plane};
 
 use self::util::{extract_ar_row, get_block_mean, get_noise_var, linsolve, multiply_mat};
@@ -76,7 +78,7 @@ impl FlatBlockFinder {
     // in extreme cases.
     #[must_use]
     #[allow(clippy::too_many_lines)]
-    pub fn run(&self, plane: &Plane<u8>) -> (Vec<u8>, usize) {
+    pub fn run(&self, plane: &Plane<u8>, pool: Option<&ThreadPool>) -> (Vec<u8>, usize) {
         const TRACE_THRESHOLD: f64 = 0.15f64 / BLOCK_SIZE_SQUARED as f64;
         const RATIO_THRESHOLD: f64 = 1.25f64;
         const NORM_THRESHOLD: f64 = 0.08f64 / BLOCK_SIZE_SQUARED as f64;
@@ -96,89 +98,117 @@ impl FlatBlockFinder {
         let num_blocks_h = plane.height().get().div_ceil(BLOCK_SIZE);
         let num_blocks = num_blocks_w * num_blocks_h;
         let mut flat_blocks = vec![0u8; num_blocks];
-        let mut num_flat = 0;
-        let mut plane_result = [0.0f64; BLOCK_SIZE_SQUARED];
-        let mut block_result = [0.0f64; BLOCK_SIZE_SQUARED];
         let mut scores = vec![IndexAndScore::default(); num_blocks];
 
-        for by in 0..num_blocks_h {
-            for bx in 0..num_blocks_w {
-                // Compute gradient covariance matrix.
-                let mut gxx = 0f64;
-                let mut gxy = 0f64;
-                let mut gyy = 0f64;
-                let mut var = 0f64;
-                let mut mean = 0f64;
+        let process_rows = |start_by: usize,
+                            flat_rows: &mut [u8],
+                            score_rows: &mut [IndexAndScore]| {
+            let mut num_flat = 0usize;
+            let mut plane_result = [0.0f64; BLOCK_SIZE_SQUARED];
+            let mut block_result = [0.0f64; BLOCK_SIZE_SQUARED];
+            for (row, (flat_row, score_row)) in flat_rows
+                .chunks_exact_mut(num_blocks_w)
+                .zip(score_rows.chunks_exact_mut(num_blocks_w))
+                .enumerate()
+            {
+                let by = start_by + row;
+                for bx in 0..num_blocks_w {
+                    // Compute gradient covariance matrix.
+                    let mut gxx = 0f64;
+                    let mut gxy = 0f64;
+                    let mut gyy = 0f64;
+                    let mut var = 0f64;
+                    let mut mean = 0f64;
 
-                self.extract_block(
-                    plane,
-                    bx * BLOCK_SIZE,
-                    by * BLOCK_SIZE,
-                    &mut plane_result,
-                    &mut block_result,
-                );
-                for yi in 1..(BLOCK_SIZE - 1) {
-                    for xi in 1..(BLOCK_SIZE - 1) {
-                        // SAFETY: We know the size of `block_result` and that we cannot exceed the bounds of it
-                        unsafe {
-                            let result_ptr = block_result.as_ptr().add(yi * BLOCK_SIZE + xi);
+                    self.extract_block(
+                        plane,
+                        bx * BLOCK_SIZE,
+                        by * BLOCK_SIZE,
+                        &mut plane_result,
+                        &mut block_result,
+                    );
+                    for yi in 1..(BLOCK_SIZE - 1) {
+                        for xi in 1..(BLOCK_SIZE - 1) {
+                            // SAFETY: We know the size of `block_result` and that we cannot exceed the bounds of it
+                            unsafe {
+                                let result_ptr = block_result.as_ptr().add(yi * BLOCK_SIZE + xi);
 
-                            let gx = (*result_ptr.add(1) - *result_ptr.sub(1)) / 2f64;
-                            let gy =
-                                (*result_ptr.add(BLOCK_SIZE) - *result_ptr.sub(BLOCK_SIZE)) / 2f64;
-                            gxx += gx * gx;
-                            gxy += gx * gy;
-                            gyy += gy * gy;
+                                let gx = (*result_ptr.add(1) - *result_ptr.sub(1)) / 2f64;
+                                let gy = (*result_ptr.add(BLOCK_SIZE)
+                                    - *result_ptr.sub(BLOCK_SIZE))
+                                    / 2f64;
+                                gxx += gx * gx;
+                                gxy += gx * gy;
+                                gyy += gy * gy;
 
-                            let block_val = *result_ptr;
-                            mean += block_val;
-                            var += block_val * block_val;
+                                let block_val = *result_ptr;
+                                mean += block_val;
+                                var += block_val * block_val;
+                            }
                         }
                     }
-                }
-                let block_size_norm_factor = (BLOCK_SIZE - 2).pow(2) as f64;
-                mean /= block_size_norm_factor;
+                    let block_size_norm_factor = (BLOCK_SIZE - 2).pow(2) as f64;
+                    mean /= block_size_norm_factor;
 
-                // Normalize gradients by block_size.
-                gxx /= block_size_norm_factor;
-                gxy /= block_size_norm_factor;
-                gyy /= block_size_norm_factor;
-                var = mean.mul_add(-mean, var / block_size_norm_factor);
+                    // Normalize gradients by block_size.
+                    gxx /= block_size_norm_factor;
+                    gxy /= block_size_norm_factor;
+                    gyy /= block_size_norm_factor;
+                    var = mean.mul_add(-mean, var / block_size_norm_factor);
 
-                let trace = gxx + gyy;
-                let det = gxx.mul_add(gyy, -gxy.powi(2));
-                let e_sub = (trace.mul_add(trace, -4f64 * det)).max(0.).sqrt();
-                let e1 = f64::midpoint(trace, e_sub);
-                let e2 = (trace - e_sub) / 2.0f64;
-                // Spectral norm
-                let norm = e1;
-                let ratio = e1 / e2.max(1.0e-6_f64);
-                let is_flat = trace < TRACE_THRESHOLD
-                    && ratio < RATIO_THRESHOLD
-                    && norm < NORM_THRESHOLD
-                    && var > VAR_THRESHOLD;
+                    let trace = gxx + gyy;
+                    let det = gxx.mul_add(gyy, -gxy.powi(2));
+                    let e_sub = (trace.mul_add(trace, -4f64 * det)).max(0.).sqrt();
+                    let e1 = f64::midpoint(trace, e_sub);
+                    let e2 = (trace - e_sub) / 2.0f64;
+                    // Spectral norm
+                    let norm = e1;
+                    let ratio = e1 / e2.max(1.0e-6_f64);
+                    let is_flat = trace < TRACE_THRESHOLD
+                        && ratio < RATIO_THRESHOLD
+                        && norm < NORM_THRESHOLD
+                        && var > VAR_THRESHOLD;
 
-                let sum_weights = NORM_WEIGHT.mul_add(
-                    norm,
-                    TRACE_WEIGHT.mul_add(
-                        trace,
-                        VAR_WEIGHT.mul_add(var, RATIO_WEIGHT.mul_add(ratio, OFFSET)),
-                    ),
-                );
-                // clamp the value to [-25.0, 100.0] to prevent overflow
-                let sum_weights = sum_weights.clamp(-25.0f64, 100.0f64);
-                let score = (1.0f64 / (1.0f64 + (-sum_weights).exp())) as f32;
-                let index = by * num_blocks_w + bx;
-                *get_dbg_mut(&mut flat_blocks, index) = if is_flat { 255 } else { 0 };
-                *get_dbg_mut(&mut scores, index) = IndexAndScore {
-                    score: if var > VAR_THRESHOLD { score } else { 0f32 },
-                    index,
-                };
-                if is_flat {
-                    num_flat += 1;
+                    let sum_weights = NORM_WEIGHT.mul_add(
+                        norm,
+                        TRACE_WEIGHT.mul_add(
+                            trace,
+                            VAR_WEIGHT.mul_add(var, RATIO_WEIGHT.mul_add(ratio, OFFSET)),
+                        ),
+                    );
+                    // clamp the value to [-25.0, 100.0] to prevent overflow
+                    let sum_weights = sum_weights.clamp(-25.0f64, 100.0f64);
+                    let score = (1.0f64 / (1.0f64 + (-sum_weights).exp())) as f32;
+                    let index = by * num_blocks_w + bx;
+                    *get_dbg_mut(flat_row, bx) = if is_flat { 255 } else { 0 };
+                    *get_dbg_mut(score_row, bx) = IndexAndScore {
+                        score: if var > VAR_THRESHOLD { score } else { 0f32 },
+                        index,
+                    };
+                    if is_flat {
+                        num_flat += 1;
+                    }
                 }
             }
-        }
+            num_flat
+        };
+
+        let mut num_flat = if let Some(pool) = pool {
+            let rows_per_job = num_blocks_h.div_ceil(pool.current_num_threads());
+            let blocks_per_job = rows_per_job * num_blocks_w;
+            pool.install(|| {
+                flat_blocks
+                    .par_chunks_mut(blocks_per_job)
+                    .zip(scores.par_chunks_mut(blocks_per_job))
+                    .enumerate()
+                    .map(|(job, (flat_rows, score_rows))| {
+                        process_rows(job * rows_per_job, flat_rows, score_rows)
+                    })
+                    .sum()
+            })
+        } else {
+            process_rows(0, &mut flat_blocks, &mut scores)
+        };
 
         scores.sort_unstable_by(|a, b| a.score.partial_cmp(&b.score).expect("Shouldn't be NaN"));
 
@@ -350,12 +380,47 @@ impl NoiseStrengthLut {
     }
 }
 
-#[derive(Debug, Clone)]
 pub(super) struct NoiseModel {
     combined_state: [NoiseModelState; 3],
     latest_state: [NoiseModelState; 3],
     n: usize,
     coords: Vec<[isize; 2]>,
+    workers: Vec<ObservationWorker>,
+    pool: Option<ThreadPool>,
+    pool_threads: usize,
+}
+
+struct ObservationWorker {
+    a: Vec<f64>,
+    b: Vec<f64>,
+    buffer: Box<[f64]>,
+    observations: usize,
+}
+
+impl ObservationWorker {
+    fn new(n: usize, num_coords: usize) -> Self {
+        Self {
+            a: vec![0.0; n * n],
+            b: vec![0.0; n],
+            buffer: vec![0.0; num_coords + 1].into_boxed_slice(),
+            observations: 0,
+        }
+    }
+
+    fn reset(&mut self, n: usize, num_coords: usize) {
+        self.a.resize(n * n, 0.0);
+        self.a.fill(0.0);
+        self.b.resize(n, 0.0);
+        self.b.fill(0.0);
+        // The extraction routine overwrites every entry it reads, but keep
+        // initialization identical to a newly allocated buffer.
+        if self.buffer.len() != num_coords + 1 {
+            self.buffer = vec![0.0; num_coords + 1].into_boxed_slice();
+        } else {
+            self.buffer.fill(0.0);
+        }
+        self.observations = 0;
+    }
 }
 
 impl NoiseModel {
@@ -392,6 +457,29 @@ impl NoiseModel {
             latest_state,
             n,
             coords,
+            workers: Vec::new(),
+            pool: None,
+            pool_threads: 0,
+        }
+    }
+
+    pub fn worker_pool(&mut self, threads: usize) -> Option<&ThreadPool> {
+        if threads <= 1 {
+            return None;
+        }
+        self.ensure_pool(threads);
+        self.pool.as_ref()
+    }
+
+    fn ensure_pool(&mut self, threads: usize) {
+        if threads > 1 && self.pool_threads != threads {
+            self.pool = Some(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .expect("failed to create grain worker pool"),
+            );
+            self.pool_threads = threads;
         }
     }
 
@@ -790,6 +878,7 @@ impl NoiseModel {
         sample_step: usize,
         frame_index: usize,
     ) {
+        self.ensure_pool(threads);
         let num_coords = self.n;
         let n = get_dbg(&self.latest_state, channel).eqns.n;
         let block_w = BLOCK_SIZE / source.geometry().subsampling_x.get() as usize;
@@ -807,12 +896,15 @@ impl NoiseModel {
         let alt_denoised_origin = alt_denoised.map(|s| get_dbg(s.data(), s.data_origin()..));
         // Avoid dividing every matrix contribution inside the pixel loop.
         let inverse_normalization = 1.0 / BLOCK_NORMALIZATION.powi(2);
+        let coords = &self.coords;
 
-        let calculate = |start_by: usize, end_by: usize| {
-            let mut a = vec![0f64; n * n];
-            let mut b = vec![0f64; n];
-            let mut observations = 0usize;
-            let mut buffer = vec![0f64; num_coords + 1].into_boxed_slice();
+        let calculate = |start_by: usize, end_by: usize, worker: &mut ObservationWorker| {
+            let ObservationWorker {
+                a,
+                b,
+                buffer,
+                observations,
+            } = worker;
             for by in start_by..end_by {
                 let y_o = by * block_h;
                 for bx in 0..num_blocks_w {
@@ -847,7 +939,7 @@ impl NoiseModel {
                             let first_x = x_start + (by + bx + y + frame_index) % sample_step;
                             for x in (first_x..x_end).step_by(sample_step) {
                                 let val = extract_ar_row(
-                                    &self.coords,
+                                    coords,
                                     num_coords,
                                     source_origin,
                                     denoised_origin,
@@ -858,18 +950,18 @@ impl NoiseModel {
                                     alt_stride,
                                     x + x_o,
                                     y + y_o,
-                                    &mut buffer,
+                                    buffer,
                                 );
                                 for i in 0..n {
                                     for j in 0..=i {
-                                        let value = (*get_dbg(&buffer, i) * *get_dbg(&buffer, j))
+                                        let value = (*get_dbg(buffer, i) * *get_dbg(buffer, j))
                                             * inverse_normalization;
-                                        *get_dbg_mut(&mut a, i * n + j) += value;
+                                        *get_dbg_mut(a, i * n + j) += value;
                                     }
-                                    *get_dbg_mut(&mut b, i) +=
-                                        (*get_dbg(&buffer, i) * val) * inverse_normalization;
+                                    *get_dbg_mut(b, i) +=
+                                        (*get_dbg(buffer, i) * val) * inverse_normalization;
                                 }
-                                observations += 1;
+                                *observations += 1;
                             }
                         }
                     }
@@ -878,42 +970,44 @@ impl NoiseModel {
             // Every cross-product has the same value on both sides of the diagonal.
             for i in 1..n {
                 for j in 0..i {
-                    *get_dbg_mut(&mut a, j * n + i) = *get_dbg(&a, i * n + j);
+                    *get_dbg_mut(a, j * n + i) = *get_dbg(a, i * n + j);
                 }
             }
-            (a, b, observations)
         };
 
         let threads = threads.min(num_blocks_h.max(1));
-        let partials = if threads == 1 {
-            vec![calculate(0, num_blocks_h)]
+        let rows_per_thread = num_blocks_h.div_ceil(threads);
+        let job_count = num_blocks_h.div_ceil(rows_per_thread);
+        self.workers
+            .resize_with(job_count, || ObservationWorker::new(n, num_coords));
+        for worker in &mut self.workers[..job_count] {
+            worker.reset(n, num_coords);
+        }
+        if threads == 1 {
+            calculate(0, num_blocks_h, &mut self.workers[0]);
         } else {
-            let rows_per_thread = num_blocks_h.div_ceil(threads);
-            std::thread::scope(|scope| {
-                let calculate = &calculate;
-                let handles: Vec<_> = (0..num_blocks_h)
-                    .step_by(rows_per_thread)
-                    .map(|start| {
-                        scope.spawn(move || {
-                            calculate(start, (start + rows_per_thread).min(num_blocks_h))
-                        })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|handle| handle.join().expect("grain worker panicked"))
-                    .collect::<Vec<_>>()
-            })
-        };
+            self.pool
+                .as_ref()
+                .expect("grain worker pool missing")
+                .scope(|scope| {
+                    let calculate = &calculate;
+                    for (index, worker) in self.workers[..job_count].iter_mut().enumerate() {
+                        let start = index * rows_per_thread;
+                        scope.spawn(move |_| {
+                            calculate(start, (start + rows_per_thread).min(num_blocks_h), worker);
+                        });
+                    }
+                });
+        }
         let state = get_dbg_mut(&mut self.latest_state, channel);
-        for (a, b, observations) in partials {
-            for (sum, value) in state.eqns.a.iter_mut().zip(a) {
-                *sum += value;
+        for worker in &self.workers[..job_count] {
+            for (sum, value) in state.eqns.a.iter_mut().zip(&worker.a) {
+                *sum += *value;
             }
-            for (sum, value) in state.eqns.b.iter_mut().zip(b) {
-                *sum += value;
+            for (sum, value) in state.eqns.b.iter_mut().zip(&worker.b) {
+                *sum += *value;
             }
-            state.num_observations += observations;
+            state.num_observations += worker.observations;
         }
     }
 

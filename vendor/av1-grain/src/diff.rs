@@ -101,7 +101,9 @@ impl DiffGenerator {
     fn diff_frame_internal(&mut self, source: &Frame<u8>, denoised: &Frame<u8>) -> Result<()> {
         verify_dimensions_match(source, denoised)?;
 
-        let (flat_blocks, num_flat_blocks) = self.flat_block_finder.run(&source.y_plane);
+        let (flat_blocks, num_flat_blocks) = self
+            .flat_block_finder
+            .run(&source.y_plane, self.noise_model.worker_pool(self.threads));
         log::debug!("Num flat blocks: {num_flat_blocks}");
 
         log::debug!("Updating noise model");

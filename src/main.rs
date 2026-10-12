@@ -39,6 +39,24 @@ use crate::{
 
 const PROGRESS_CHARS: &str = "█▉▊▋▌▍▎▏  ";
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum NoiseSampling {
+    All,
+    Half,
+    Quarter,
+}
+
+impl NoiseSampling {
+    fn sample_step(self) -> usize {
+        match self {
+            Self::All => 1,
+            Self::Half => 2,
+            Self::Quarter => 4,
+        }
+    }
+}
+
+/// The v0.3.3 spelling remains accepted for existing scripts.
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 pub enum DiffAccuracy {
     #[default]
@@ -56,6 +74,7 @@ impl DiffAccuracy {
         }
     }
 }
+
 const INDICATIF_PROGRESS_TEMPLATE: &str = if cfg!(windows) {
     // Do not use a spinner on Windows since the default console cannot display
     // the characters used for the spinner
@@ -426,6 +445,7 @@ pub fn main() -> Result<()> {
             overwrite,
             filters,
             threads,
+            noise_sampling,
             accuracy,
         } => {
             if threads == Some(0) {
@@ -507,7 +527,10 @@ pub fn main() -> Result<()> {
                 threads.unwrap_or_else(|| {
                     std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
                 }),
-                accuracy.sample_step(),
+                noise_sampling
+                    .map(NoiseSampling::sample_step)
+                    .or_else(|| accuracy.map(DiffAccuracy::sample_step))
+                    .unwrap_or(1),
             );
             let non_zero_source_bd =
                 NonZeroU8::new(source_bd as u8).ok_or_else(|| anyhow!("bd should not be 0"))?;
@@ -983,10 +1006,12 @@ pub enum Commands {
         /// Number of threads for grain analysis (default: all available CPU threads).
         #[clap(long)]
         threads: Option<usize>,
-        /// Grain analysis accuracy (full, balanced, or fast).
-        /// Balanced samples half the horizontal noise observations (fast samples one quarter).
-        #[clap(long, value_enum, default_value_t)]
-        accuracy: DiffAccuracy,
+        /// Noise equation observations to sample: all, half, or quarter (default: all).
+        #[clap(long, value_enum, conflicts_with = "accuracy")]
+        noise_sampling: Option<NoiseSampling>,
+        /// Legacy spelling for --noise-sampling (full=all, balanced=half, fast=quarter).
+        #[clap(long, value_enum, hide = true)]
+        accuracy: Option<DiffAccuracy>,
     },
     /// Analyzes a source video and estimates the amount of noise in the source,
     /// then generates an appropriate film grain table. This is less accurate

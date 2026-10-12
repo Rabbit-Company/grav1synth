@@ -38,6 +38,7 @@ default = [
 diff = [
     "num-rational",
     "v_frame",
+    "rayon",
 ]
 estimate = ["v_frame"]
 parse = ["nom"]
@@ -69,6 +70,10 @@ optional = true
 
 [dependencies.num-rational]
 version = "0.4.1"
+optional = true
+
+[dependencies.rayon]
+version = "1.11"
 optional = true
 
 [dependencies.serde]

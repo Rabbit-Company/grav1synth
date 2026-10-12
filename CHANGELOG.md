@@ -1,3 +1,12 @@
+## Version 0.3.4
+
+- Reuse grain analysis worker threads and scratch buffers across frames, keeping
+  the same row partitions and result order for a fixed `--threads` setting.
+- Score independent flat blocks in parallel using the same worker pool.
+- Rename the `diff` analysis control to `--noise-sampling all|half|quarter`.
+  The former `--accuracy full|balanced|fast` spelling remains accepted for scripts.
+  All three modes use the same analysis as their corresponding v0.3.3 modes.
+
 ## Version 0.3.3
 
 - Add `diff --accuracy full|balanced|fast`. Full retains the v0.3.2 analysis.
