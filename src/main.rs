@@ -21,7 +21,7 @@ use av1_grain::{
     DiffGenerator, TransferFunction, generate_photon_noise_params, parse_grain_table,
     v_frame::{frame::Frame, pixel::Pixel},
 };
-use clap::{ArgGroup, Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use crossterm::tty::IsTty;
 use dialoguer::Confirm;
 use ffmpeg::{
@@ -38,6 +38,24 @@ use crate::{
 };
 
 const PROGRESS_CHARS: &str = "█▉▊▋▌▍▎▏  ";
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+pub enum DiffAccuracy {
+    #[default]
+    Full,
+    Balanced,
+    Fast,
+}
+
+impl DiffAccuracy {
+    fn sample_step(self) -> usize {
+        match self {
+            Self::Full => 1,
+            Self::Balanced => 2,
+            Self::Fast => 4,
+        }
+    }
+}
 const INDICATIF_PROGRESS_TEMPLATE: &str = if cfg!(windows) {
     // Do not use a spinner on Windows since the default console cannot display
     // the characters used for the spinner
@@ -408,6 +426,7 @@ pub fn main() -> Result<()> {
             overwrite,
             filters,
             threads,
+            accuracy,
         } => {
             if threads == Some(0) {
                 bail!("--threads must be at least 1");
@@ -478,7 +497,7 @@ pub fn main() -> Result<()> {
             let frame_rate = source_reader.get_video_details().frame_rate;
             let source_bd = source_reader.get_video_details().bit_depth;
             let denoised_bd = denoised_reader.get_video_details().bit_depth;
-            let mut differ = DiffGenerator::new_with_threads(
+            let mut differ = DiffGenerator::new_with_options(
                 num_rational::Rational64::new(
                     i64::from(*frame_rate.numer()),
                     i64::from(*frame_rate.denom()),
@@ -488,6 +507,7 @@ pub fn main() -> Result<()> {
                 threads.unwrap_or_else(|| {
                     std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
                 }),
+                accuracy.sample_step(),
             );
             let non_zero_source_bd =
                 NonZeroU8::new(source_bd as u8).ok_or_else(|| anyhow!("bd should not be 0"))?;
@@ -963,6 +983,10 @@ pub enum Commands {
         /// Number of threads for grain analysis (default: all available CPU threads).
         #[clap(long)]
         threads: Option<usize>,
+        /// Grain analysis accuracy (full, balanced, or fast).
+        /// Balanced samples half the horizontal noise observations (fast samples one quarter).
+        #[clap(long, value_enum, default_value_t)]
+        accuracy: DiffAccuracy,
     },
     /// Analyzes a source video and estimates the amount of noise in the source,
     /// then generates an appropriate film grain table. This is less accurate

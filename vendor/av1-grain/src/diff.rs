@@ -20,6 +20,7 @@ pub struct DiffGenerator {
     noise_model: NoiseModel,
     grain_table: Vec<GrainTableSegment>,
     threads: usize,
+    sample_step: usize,
 }
 
 impl DiffGenerator {
@@ -38,6 +39,19 @@ impl DiffGenerator {
         denoised_bit_depth: usize,
         threads: usize,
     ) -> Self {
+        Self::new_with_options(fps, source_bit_depth, denoised_bit_depth, threads, 1)
+    }
+
+    /// Creates a generator that uses one of every `sample_step` horizontal
+    /// noise observations. A value of zero is treated as one.
+    #[must_use]
+    pub fn new_with_options(
+        fps: Rational64,
+        source_bit_depth: usize,
+        denoised_bit_depth: usize,
+        threads: usize,
+        sample_step: usize,
+    ) -> Self {
         Self {
             frame_count: 0,
             fps,
@@ -48,6 +62,7 @@ impl DiffGenerator {
             source_bit_depth,
             denoised_bit_depth,
             threads: threads.max(1),
+            sample_step: sample_step.max(1),
         }
     }
 
@@ -90,9 +105,14 @@ impl DiffGenerator {
         log::debug!("Num flat blocks: {num_flat_blocks}");
 
         log::debug!("Updating noise model");
-        let status = self
-            .noise_model
-            .update(source, denoised, &flat_blocks, self.threads);
+        let status = self.noise_model.update(
+            source,
+            denoised,
+            &flat_blocks,
+            self.threads,
+            self.sample_step,
+            self.frame_count,
+        );
 
         if status == NoiseStatus::DifferentType {
             let cur_timestamp = self.frame_count as u64 * 10_000_000u64 * *self.fps.denom() as u64

@@ -47,6 +47,8 @@ Compares `my_source.mkv` and `denoised_source.mkv` and generates a film grain ta
 
 The `diff` command uses all available CPU threads for grain analysis by default. Use `--threads 8` (or another positive number) to limit its CPU use when other work, such as encoding, runs at the same time. Frames are still analyzed in order.
 
+Use `--accuracy full` (the default) to analyze every noise observation, with the same output as v0.3.2. `--accuracy balanced` analyzes about half the horizontal noise observations, while `--accuracy fast` analyzes about one quarter. Both faster modes still decode every frame, check the full image for flat blocks, and measure grain strength in every flat block. They can change the resulting table, particularly on short or unusual scenes (compare encodes before using them for a whole video).
+
 <!-- ### `grav1synth estimate my_source.mkv -o grain_file.txt`
 
 Analyzes `my_source.mkv` and estimates the amount of noise in the source, then generates an appropriate film grain table at `grain_file.txt`. This is less accurate than the diff method, but is significantly faster. -->

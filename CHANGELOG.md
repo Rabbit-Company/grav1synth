@@ -1,3 +1,10 @@
+## Version 0.3.3
+
+- Add `diff --accuracy full|balanced|fast`. Full retains the v0.3.2 analysis.
+  balanced and fast sample half and one quarter of the noise equation observations,
+  respectively, while still decoding every frame and measuring grain strength in
+  every flat block. Sampling rotates across rows, blocks, and frames to reduce bias.
+
 ## Version 0.3.2
 
 - Reduce work in `diff`'s noise equation loop by reusing the normalization factor

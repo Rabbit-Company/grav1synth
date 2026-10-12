@@ -401,6 +401,8 @@ impl NoiseModel {
         denoised: &Frame<u8>,
         flat_blocks: &[u8],
         threads: usize,
+        sample_step: usize,
+        frame_index: usize,
     ) -> NoiseStatus {
         let num_blocks_w = source.y_plane.width().get().div_ceil(BLOCK_SIZE);
         let num_blocks_h = source.y_plane.height().get().div_ceil(BLOCK_SIZE);
@@ -464,6 +466,8 @@ impl NoiseModel {
                 num_blocks_w,
                 num_blocks_h,
                 threads,
+                sample_step,
+                frame_index,
             );
 
             if !get_dbg_mut(&mut self.latest_state, channel).ar_equation_system_solve(is_chroma) {
@@ -783,6 +787,8 @@ impl NoiseModel {
         num_blocks_w: usize,
         num_blocks_h: usize,
         threads: usize,
+        sample_step: usize,
+        frame_index: usize,
     ) {
         let num_coords = self.n;
         let n = get_dbg(&self.latest_state, channel).eqns.n;
@@ -836,7 +842,10 @@ impl NoiseModel {
                             },
                         );
                         for y in y_start..y_end {
-                            for x in x_start..x_end {
+                            // Rotate the sampling phase across blocks, rows and frames so
+                            // repeated image patterns do not always hit the same columns.
+                            let first_x = x_start + (by + bx + y + frame_index) % sample_step;
+                            for x in (first_x..x_end).step_by(sample_step) {
                                 let val = extract_ar_row(
                                     &self.coords,
                                     num_coords,

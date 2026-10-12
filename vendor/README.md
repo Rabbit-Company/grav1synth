@@ -12,4 +12,6 @@ block rows concurrently, then combine their results in row order. Frame order
 and the noise model's state remain serial. The solver also calculates only the
 unique half of each symmetric noise equation matrix. Its hot loop reuses one
 reciprocal normalization factor and copies the symmetric matrix entries once
-per worker instead of once per pixel. Other crate behavior is unchanged.
+per worker instead of once per pixel. The `diff --accuracy` modes sample noise
+equation observations in this solver. The default sample step of one preserves
+the full v0.3.2 analysis. Other crate behavior is unchanged.
