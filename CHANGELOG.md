@@ -1,3 +1,8 @@
+## Version 0.3.5
+
+- Add `diff --frames N` to supply the source frame count for the progress bar.
+  This skips the packet count that otherwise reads the whole source before the diff starts.
+
 ## Version 0.3.4
 
 - Reuse grain analysis worker threads and scratch buffers across frames, keeping

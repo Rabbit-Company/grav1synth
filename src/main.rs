@@ -445,6 +445,7 @@ pub fn main() -> Result<()> {
             overwrite,
             filters,
             threads,
+            frames,
             noise_sampling,
             accuracy,
         } => {
@@ -492,7 +493,8 @@ pub fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let frame_count = get_frame_count(&source).ok();
+            // Counting packets reads the whole source, so skip it when the caller knows the total.
+            let frame_count = frames.or_else(|| get_frame_count(&source).ok());
 
             let progress = if stderr().is_tty() {
                 let pb = frame_count.map_or_else(
@@ -1006,6 +1008,11 @@ pub enum Commands {
         /// Number of threads for grain analysis (default: all available CPU threads).
         #[clap(long)]
         threads: Option<usize>,
+        /// Number of frames in the source, used only for the progress bar.
+        ///
+        /// Without it, the source is read once before the diff starts to count its frames.
+        #[clap(long)]
+        frames: Option<usize>,
         /// Noise equation observations to sample: all, half, or quarter (default: all).
         #[clap(long, value_enum, conflicts_with = "accuracy")]
         noise_sampling: Option<NoiseSampling>,
