@@ -1,3 +1,9 @@
+## Version 0.3.7
+
+- Analyze several frame pairs at once in `diff` and add them to the noise model in order.
+  All three planes of a frame share the worker pool, and the 8-bit conversion runs on the
+  decoder threads. The table is unchanged for a fixed `--threads` setting.
+
 ## Version 0.3.6
 
 - Decode the source and denoised video with multiple threads in `diff`. Each decoder uses

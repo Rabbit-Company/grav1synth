@@ -10,7 +10,7 @@ use std::{
     io::{BufWriter, Write, stderr},
     num::NonZeroU8,
     path::PathBuf,
-    sync::mpsc::sync_channel,
+    sync::mpsc::{TryRecvError, sync_channel},
     time::Duration,
 };
 
@@ -18,7 +18,7 @@ use anyhow::{Result, anyhow, bail};
 #[cfg(feature = "unstable")]
 use av1_grain::estimate_plane_noise;
 use av1_grain::{
-    DiffGenerator, TransferFunction, generate_photon_noise_params, parse_grain_table,
+    DiffGenerator, TransferFunction, frame_to_u8, generate_photon_noise_params, parse_grain_table,
     v_frame::{frame::Frame, pixel::Pixel},
 };
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
@@ -542,10 +542,20 @@ pub fn main() -> Result<()> {
             let non_zero_source_bd =
                 NonZeroU8::new(source_bd as u8).ok_or_else(|| anyhow!("bd should not be 0"))?;
 
-            // Decode both inputs ahead while the grain model analyzes the previous pair.
+            // Several frame pairs are analyzed at once and added to the model in order.
+            // One pair keeps a few threads busy, so this is what fills the CPU.
+            let batch_size = if threads > 1 {
+                threads.div_ceil(2).min(8)
+            } else {
+                1
+            };
+
+            // Decode both inputs ahead while the grain model analyzes earlier pairs.
             // Bounded channels keep memory use predictable and preserve each stream's order.
-            let (source_sender, source_receiver) = sync_channel::<Result<DecodedFrame>>(2);
-            let (denoised_sender, denoised_receiver) = sync_channel::<Result<DecodedFrame>>(2);
+            let (source_sender, source_receiver) =
+                sync_channel::<Result<Option<Frame<u8>>>>(batch_size);
+            let (denoised_sender, denoised_receiver) =
+                sync_channel::<Result<Option<Frame<u8>>>>(batch_size);
             let source_producer = std::thread::spawn(move || {
                 loop {
                     let frame = read_diff_frame(
@@ -554,7 +564,7 @@ pub fn main() -> Result<()> {
                         filters.as_ref(),
                         non_zero_source_bd,
                     );
-                    let done = matches!(&frame, Ok(DecodedFrame::End) | Err(_));
+                    let done = matches!(&frame, Ok(None) | Err(_));
                     if source_sender.send(frame).is_err() || done {
                         break;
                     }
@@ -568,7 +578,7 @@ pub fn main() -> Result<()> {
                         None,
                         non_zero_source_bd,
                     );
-                    let done = matches!(&frame, Ok(DecodedFrame::End) | Err(_));
+                    let done = matches!(&frame, Ok(None) | Err(_));
                     if denoised_sender.send(frame).is_err() || done {
                         break;
                     }
@@ -576,38 +586,48 @@ pub fn main() -> Result<()> {
             });
             let consume_result = (|| -> Result<usize> {
                 let mut frames = 0usize;
-                loop {
-                    debug!("Diffing next frame");
-                    let source_frame = source_receiver
-                        .recv()
-                        .map_err(|_| anyhow!("Source decoder stopped before end of input"))??;
-                    let denoised_frame = denoised_receiver
-                        .recv()
-                        .map_err(|_| anyhow!("Denoised decoder stopped before end of input"))??;
-                    match (source_frame, denoised_frame) {
-                        (DecodedFrame::U8(source), DecodedFrame::U8(denoised)) => {
-                            differ.diff_frame(&source, &denoised)?
-                        }
-                        (DecodedFrame::U8(source), DecodedFrame::U16(denoised)) => {
-                            differ.diff_frame(&source, &denoised)?
-                        }
-                        (DecodedFrame::U16(source), DecodedFrame::U8(denoised)) => {
-                            differ.diff_frame(&source, &denoised)?
-                        }
-                        (DecodedFrame::U16(source), DecodedFrame::U16(denoised)) => {
-                            differ.diff_frame(&source, &denoised)?
-                        }
-                        (DecodedFrame::End, DecodedFrame::End) => break,
-                        _ => {
-                            warn!(
-                                "Videos did not have equal frame counts. Resulting grain table \
-                                 may not be as expected."
-                            );
-                            break;
+                let mut batch = Vec::with_capacity(batch_size);
+                let mut done = false;
+                while !done {
+                    batch.clear();
+                    while batch.len() < batch_size {
+                        // Wait for the first pair, then take only what is already decoded.
+                        let source_frame = if batch.is_empty() {
+                            source_receiver.recv().map_err(|_| {
+                                anyhow!("Source decoder stopped before end of input")
+                            })??
+                        } else {
+                            match source_receiver.try_recv() {
+                                Ok(frame) => frame?,
+                                Err(TryRecvError::Empty) => break,
+                                Err(TryRecvError::Disconnected) => {
+                                    bail!("Source decoder stopped before end of input")
+                                }
+                            }
+                        };
+                        let denoised_frame = denoised_receiver.recv().map_err(|_| {
+                            anyhow!("Denoised decoder stopped before end of input")
+                        })??;
+                        match (source_frame, denoised_frame) {
+                            (Some(source), Some(denoised)) => batch.push((source, denoised)),
+                            (None, None) => {
+                                done = true;
+                                break;
+                            }
+                            _ => {
+                                warn!(
+                                    "Videos did not have equal frame counts. Resulting grain \
+                                     table may not be as expected."
+                                );
+                                done = true;
+                                break;
+                            }
                         }
                     }
-                    frames += 1;
-                    progress.inc(1);
+                    debug!("Diffing next {} frames", batch.len());
+                    differ.diff_frames(&batch)?;
+                    frames += batch.len();
+                    progress.inc(batch.len() as u64);
                 }
                 Ok(frames)
             })();
@@ -712,12 +732,6 @@ pub fn main() -> Result<()> {
     Ok(())
 }
 
-enum DecodedFrame {
-    U8(Frame<u8>),
-    U16(Frame<u16>),
-    End,
-}
-
 fn apply_diff_filter<T: Pixel>(
     frame: Frame<T>,
     filters: Option<&FilterChain>,
@@ -730,21 +744,24 @@ fn apply_diff_filter<T: Pixel>(
     }
 }
 
+/// Reads the next frame in the 8-bit form the grain analysis works on.
+/// Converting here keeps that work on the decoder threads.
 fn read_diff_frame(
     reader: &mut BitstreamReader,
     bit_depth: usize,
     filters: Option<&FilterChain>,
     source_bit_depth: NonZeroU8,
-) -> Result<DecodedFrame> {
+) -> Result<Option<Frame<u8>>> {
     match bit_depth {
-        8 => reader.get_frame::<u8>().map(|frame| {
-            frame.map_or(DecodedFrame::End, |frame| {
-                DecodedFrame::U8(apply_diff_filter(frame, filters, source_bit_depth))
-            })
-        }),
+        8 => reader
+            .get_frame::<u8>()
+            .map(|frame| frame.map(|frame| apply_diff_filter(frame, filters, source_bit_depth))),
         9..=16 => reader.get_frame::<u16>().map(|frame| {
-            frame.map_or(DecodedFrame::End, |frame| {
-                DecodedFrame::U16(apply_diff_filter(frame, filters, source_bit_depth))
+            frame.map(|frame| {
+                frame_to_u8(
+                    &apply_diff_filter(frame, filters, source_bit_depth),
+                    bit_depth,
+                )
             })
         }),
         _ => bail!("Bit depths not between 8-16 are not currently supported"),

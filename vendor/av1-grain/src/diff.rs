@@ -1,5 +1,8 @@
+use std::borrow::Cow;
+
 use anyhow::{Result, ensure};
 use num_rational::Rational64;
+use rayon::prelude::*;
 use v_frame::{frame::Frame, pixel::Pixel};
 
 use self::solver::{FlatBlockFinder, NoiseModel};
@@ -78,10 +81,22 @@ impl DiffGenerator {
         source: &Frame<T>,
         denoised: &Frame<U>,
     ) -> Result<()> {
-        self.diff_frame_internal(
-            &frame_into_u8(source, self.source_bit_depth),
-            &frame_into_u8(denoised, self.denoised_bit_depth),
-        )
+        self.diff_frames_internal(&[(
+            &*frame_into_u8(source, self.source_bit_depth),
+            &*frame_into_u8(denoised, self.denoised_bit_depth),
+        )])
+    }
+
+    /// Processes several consecutive frame pairs that are already 8-bit, see
+    /// [`frame_to_u8`]. The pairs are analyzed concurrently and then added to the
+    /// state in order, which gives the same result as one `diff_frame` call per pair.
+    ///
+    /// # Errors
+    /// - If the frames do not have the same resolution
+    /// - If the frames do not have the same chroma subsampling
+    pub fn diff_frames(&mut self, pairs: &[(Frame<u8>, Frame<u8>)]) -> Result<()> {
+        let pairs: Vec<_> = pairs.iter().map(|(s, d)| (s, d)).collect();
+        self.diff_frames_internal(&pairs)
     }
 
     /// Finalize the state of this `DiffGenerator` and return the resulting
@@ -98,43 +113,74 @@ impl DiffGenerator {
         self.grain_table
     }
 
-    fn diff_frame_internal(&mut self, source: &Frame<u8>, denoised: &Frame<u8>) -> Result<()> {
-        verify_dimensions_match(source, denoised)?;
+    fn diff_frames_internal(&mut self, pairs: &[(&Frame<u8>, &Frame<u8>)]) -> Result<()> {
+        // Frames before a mismatched pair are still processed, as with one call per pair.
+        let mismatch = pairs
+            .iter()
+            .enumerate()
+            .find_map(|(index, (s, d))| verify_dimensions_match(s, d).err().map(|e| (index, e)));
+        let pairs = mismatch
+            .as_ref()
+            .map_or(pairs, |(index, _)| &pairs[..*index]);
 
-        let (flat_blocks, num_flat_blocks) = self
-            .flat_block_finder
-            .run(&source.y_plane, self.noise_model.worker_pool(self.threads));
-        log::debug!("Num flat blocks: {num_flat_blocks}");
+        let pool_ready = self.noise_model.worker_pool(self.threads).is_some();
+        let first_frame = self.frame_count;
+        let (threads, sample_step) = (self.threads, self.sample_step);
+        let (finder, model) = (&self.flat_block_finder, &self.noise_model);
+        let observe = |(index, (source, denoised)): (usize, &(&Frame<u8>, &Frame<u8>))| {
+            model.observe(
+                finder,
+                source,
+                denoised,
+                threads,
+                sample_step,
+                first_frame + index,
+            )
+        };
+        let observations: Vec<_> = match model.pool() {
+            Some(pool) if pool_ready && pairs.len() > 1 => {
+                pool.install(|| pairs.par_iter().enumerate().map(observe).collect())
+            }
+            _ => pairs.iter().enumerate().map(observe).collect(),
+        };
 
-        log::debug!("Updating noise model");
-        let status = self.noise_model.update(
-            source,
-            denoised,
-            &flat_blocks,
-            self.threads,
-            self.sample_step,
-            self.frame_count,
-        );
+        for ((source, denoised), observations) in pairs.iter().zip(&observations) {
+            log::debug!("Num flat blocks: {}", observations.num_flat_blocks());
 
-        if status == NoiseStatus::DifferentType {
-            let cur_timestamp = self.frame_count as u64 * 10_000_000u64 * *self.fps.denom() as u64
-                / *self.fps.numer() as u64;
-            log::debug!(
-                "Updating parameters for times {} to {}",
-                self.prev_timestamp,
-                cur_timestamp
-            );
-            self.grain_table.push(
-                self.noise_model
-                    .get_grain_parameters(self.prev_timestamp, cur_timestamp),
-            );
-            self.noise_model.save_latest();
-            self.prev_timestamp = cur_timestamp;
+            log::debug!("Updating noise model");
+            let status = self.noise_model.update(source, denoised, observations);
+
+            if status == NoiseStatus::DifferentType {
+                let cur_timestamp =
+                    self.frame_count as u64 * 10_000_000u64 * *self.fps.denom() as u64
+                        / *self.fps.numer() as u64;
+                log::debug!(
+                    "Updating parameters for times {} to {}",
+                    self.prev_timestamp,
+                    cur_timestamp
+                );
+                self.grain_table.push(
+                    self.noise_model
+                        .get_grain_parameters(self.prev_timestamp, cur_timestamp),
+                );
+                self.noise_model.save_latest();
+                self.prev_timestamp = cur_timestamp;
+            }
+            log::debug!("Noise model updated for frame {}", self.frame_count);
+            self.frame_count += 1;
         }
-        log::debug!("Noise model updated for frame {}", self.frame_count);
-        self.frame_count += 1;
 
-        Ok(())
+        mismatch.map_or(Ok(()), |(_, error)| Err(error))
+    }
+}
+
+/// Converts a frame to the 8-bit form the grain analysis works on.
+/// `diff_frame` does the same conversion internally.
+#[must_use]
+pub fn frame_to_u8<T: Pixel>(frame: &Frame<T>, bit_depth: usize) -> Frame<u8> {
+    match frame_into_u8(frame, bit_depth) {
+        Cow::Owned(frame) => frame,
+        Cow::Borrowed(frame) => frame.clone(),
     }
 }
 
