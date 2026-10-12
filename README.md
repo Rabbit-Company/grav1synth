@@ -47,6 +47,8 @@ Reads `my_encode.mkv`, removes all synthesized film grain, and outputs the video
 
 Compares `my_source.mkv` and `denoised_source.mkv` and generates a film grain table at `grain_file.txt` based on the difference between them. This will provide the most accurate estimation of source film grain.
 
+The `diff` command uses all available CPU threads for grain analysis by default. Use `--threads 8` (or another positive number) to limit its CPU use when other work, such as encoding, runs at the same time. Frames are still analyzed in order.
+
 <!-- ### `grav1synth estimate my_source.mkv -o grain_file.txt`
 
 Analyzes `my_source.mkv` and estimates the amount of noise in the source, then generates an appropriate film grain table at `grain_file.txt`. This is less accurate than the diff method, but is significantly faster. -->

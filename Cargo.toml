@@ -1,6 +1,6 @@
 [package]
 name = "grav1synth"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/Rabbit-Company/grav1synth"
@@ -49,6 +49,9 @@ opt-level = 1
 [profile.release]
 codegen-units = 1
 lto = "thin"
+
+[patch.crates-io]
+av1-grain = { path = "vendor/av1-grain" }
 
 [profile.relwithdebug]
 inherits = "release"

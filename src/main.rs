@@ -305,9 +305,7 @@ pub fn main() -> Result<()> {
                             iso_setting: iso_value,
                             width,
                             height,
-                            transfer_function: if trc
-                                == AVColorTransferCharacteristic::SMPTE2084
-                            {
+                            transfer_function: if trc == AVColorTransferCharacteristic::SMPTE2084 {
                                 TransferFunction::SMPTE2084
                             } else {
                                 TransferFunction::BT1886
@@ -408,7 +406,11 @@ pub fn main() -> Result<()> {
             output,
             overwrite,
             filters,
+            threads,
         } => {
+            if threads == Some(0) {
+                bail!("--threads must be at least 1");
+            }
             if source == output || denoised == output {
                 error!(
                     "Input and output paths are the same. This is probably a typo, because this \
@@ -475,13 +477,16 @@ pub fn main() -> Result<()> {
             let frame_rate = source_reader.get_video_details().frame_rate;
             let source_bd = source_reader.get_video_details().bit_depth;
             let denoised_bd = denoised_reader.get_video_details().bit_depth;
-            let mut differ = DiffGenerator::new(
+            let mut differ = DiffGenerator::new_with_threads(
                 num_rational::Rational64::new(
                     i64::from(*frame_rate.numer()),
                     i64::from(*frame_rate.denom()),
                 ),
                 source_bd,
                 denoised_bd,
+                threads.unwrap_or_else(|| {
+                    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+                }),
             );
             let non_zero_source_bd =
                 NonZeroU8::new(source_bd as u8).ok_or_else(|| anyhow!("bd should not be 0"))?;
@@ -833,7 +838,7 @@ fn aggregate_grain_headers(
 #[command(
     about = "Grain synth analyzer and editor for AV1 files",
     version,
-    flatten_help = true,
+    flatten_help = true
 )]
 pub struct Args {
     #[clap(subcommand)]
@@ -945,6 +950,9 @@ pub enum Commands {
         ///     Default is "catmullrom"
         #[clap(long, short, verbatim_doc_comment)]
         filters: Option<String>,
+        /// Number of threads for grain analysis (default: all available CPU threads).
+        #[clap(long)]
+        threads: Option<usize>,
     },
     /// Analyzes a source video and estimates the amount of noise in the source,
     /// then generates an appropriate film grain table. This is less accurate

@@ -1,10 +1,13 @@
-## Unreleased
+## Version 0.3.0
 
 - Merge `apply` and `generate` into a single `apply` command. `--grain <FILE>` applies
   table-based grain; `--iso <NUM>` (with optional `--chroma`) applies photon-noise-based grain.
 - `apply` now checks for existing grain headers before writing. If grain is already present it
   prints a notice and skips, unless `--replace` is also provided. This makes it safe to use in
   automated workflows where existing grain should be preserved.
+- Parallelize the noise analysis in `diff` across CPU threads while processing frames in order.
+  The new `--threads <N>` option limits workers. By default it uses the available CPU threads.
+- Build the Linux release against RabbitEncoder's FFmpeg 9.0.2 libraries.
 
 ## Version 0.2.0
 

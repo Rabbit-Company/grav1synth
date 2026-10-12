@@ -67,9 +67,13 @@ mkdir -p "$sample_dir"
   -c:v ffv1 -y "$sample_dir/denoised.mkv"
 "$repo_root/dist/$asset" diff \
   "$sample_dir/source.mkv" "$sample_dir/denoised.mkv" \
-  -o "$sample_dir/grain.tbl" -y
+  -o "$sample_dir/grain.tbl" -y --threads 1
+"$repo_root/dist/$asset" diff \
+  "$sample_dir/source.mkv" "$sample_dir/denoised.mkv" \
+  -o "$sample_dir/grain-parallel.tbl" -y --threads 4
 test -s "$sample_dir/grain.tbl"
 head -n 1 "$sample_dir/grain.tbl" | grep -qx 'filmgrn1'
+cmp "$sample_dir/grain.tbl" "$sample_dir/grain-parallel.tbl"
 
 pushd "$repo_root/dist" >/dev/null
 sha256sum "$asset" > "$asset.sha256"
