@@ -3,7 +3,7 @@ name = "grav1synth"
 version = "0.2.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/rust-av/grav1synth"
+repository = "https://github.com/Rabbit-Company/grav1synth"
 description = "Grain Synth analyzer and editor for AV1 files"
 keywords = ["video", "multimedia", "av1"]
 categories = ["multimedia", "multimedia::video", "multimedia::encoding"]
@@ -18,7 +18,7 @@ bitvec = "1.0.1"
 clap = { version = "4.0.2", features = ["derive"] }
 crossterm = "0.29.0"
 dialoguer = "0.12.0"
-ffmpeg = { version = "5.0.0", default-features = false, features = [
+ffmpeg = { version = "6.0.0", default-features = false, features = [
     "format",
 ], package = "ffmpeg-the-third" }
 indicatif = "0.18"

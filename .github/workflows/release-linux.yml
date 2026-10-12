@@ -1,0 +1,56 @@
+name: Release Linux binary
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-22.04
+    container: debian:testing-slim
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    steps:
+      - name: Install tools and deb-multimedia repository
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git
+          curl -fsSLo /tmp/deb-multimedia-keyring.deb \
+            https://www.deb-multimedia.org/pool/main/d/deb-multimedia-keyring/deb-multimedia-keyring_2024.9.1_all.deb
+          dpkg -i /tmp/deb-multimedia-keyring.deb
+          cat >/etc/apt/sources.list.d/dmo.sources <<'EOF'
+          Types: deb
+          URIs: https://www.deb-multimedia.org
+          Suites: forky
+          Components: main non-free
+          Signed-By: /usr/share/keyrings/deb-multimedia-keyring.pgp
+          Enabled: yes
+          EOF
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cargo rustc pkg-config clang libclang-dev zstd gh \
+            ffmpeg libavc1394-0 libraw1394-11 libiec61883-0 libdc1394-25 \
+            libtesseract5 libxml2-16 libbz2-1.0 libbluray4 libvpx12 \
+            libdavs2-16 libshine3 libsvtav1enc4 libtheoraenc2 \
+            libtheoradec2 libx265-217 libxavs2-13 libkvazaar7
+      - uses: actions/checkout@v4
+      - name: Build and test against RabbitEncoder FFmpeg
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || github.sha }}
+        run: bash .github/scripts/build-linux-release.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: grav1synth-linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+      - name: Attach files to the published release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" dist/* --clobber
