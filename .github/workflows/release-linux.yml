@@ -21,7 +21,7 @@ jobs:
       - name: Install tools and deb-multimedia repository
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates curl git
+          apt-get install -y --no-install-recommends ca-certificates curl git gpgv
           curl -fsSLo /tmp/deb-multimedia-keyring.deb \
             https://www.deb-multimedia.org/pool/main/d/deb-multimedia-keyring/deb-multimedia-keyring_2024.9.1_all.deb
           dpkg -i /tmp/deb-multimedia-keyring.deb
