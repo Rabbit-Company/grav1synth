@@ -1,3 +1,10 @@
+## Version 0.3.6
+
+- Decode the source and denoised video with multiple threads in `diff`. Each decoder uses
+  up to half of `--threads`. Decoded frames and the resulting table are unchanged.
+- Fix `diff` dropping packets when a decoder still held finished frames. Sources with
+  reordered frames, such as HEVC with B-frames, lost frames and produced a wrong table.
+
 ## Version 0.3.5
 
 - Add `diff --frames N` to supply the source frame count for the progress bar.

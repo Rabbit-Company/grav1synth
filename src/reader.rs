@@ -1,4 +1,4 @@
-use std::{num::NonZeroUsize, path::Path};
+use std::{io, num::NonZeroUsize, path::Path};
 
 use anyhow::{Result, bail};
 use av1_grain::v_frame::{
@@ -8,7 +8,7 @@ use av1_grain::v_frame::{
 };
 use ffmpeg::{
     Stream,
-    codec::{decoder, packet},
+    codec::decoder,
     format::{self, context::Input},
     frame, media,
 };
@@ -35,6 +35,12 @@ pub struct VideoDetails {
 
 impl BitstreamReader {
     pub fn open<P: AsRef<Path>>(input: P) -> Result<Self> {
+        Self::open_with_decoder_threads(input, 1)
+    }
+
+    /// Opens the input with a decoder that may use up to `threads` threads.
+    /// Decoded frames are the same for every thread count.
+    pub fn open_with_decoder_threads<P: AsRef<Path>>(input: P, threads: usize) -> Result<Self> {
         ffmpeg::init()?;
 
         let input_ctx = format::input(input.as_ref())?;
@@ -44,7 +50,16 @@ impl BitstreamReader {
             .ok_or(ffmpeg::Error::StreamNotFound)?;
         let stream_index = stream.index();
 
-        let context = ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
+        let mut context = ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
+        if threads > 1 {
+            // SAFETY: The context is not open yet, which is when FFmpeg reads these fields.
+            // Offering both types lets each codec pick the one it supports.
+            unsafe {
+                let ctx = context.as_mut_ptr();
+                (*ctx).thread_count = threads as i32;
+                (*ctx).thread_type = ffmpeg::ffi::FF_THREAD_FRAME | ffmpeg::ffi::FF_THREAD_SLICE;
+            }
+        }
         let mut decoder = context.decoder().video()?;
         decoder.set_parameters(stream.parameters())?;
 
@@ -124,45 +139,44 @@ impl BitstreamReader {
     }
 
     pub fn get_frame<T: Pixel>(&mut self) -> Result<Option<Frame<T>>> {
+        let mut decoded = frame::Video::empty();
         loop {
+            // Take every frame the decoder has ready before feeding it again. A decoder
+            // that still holds output refuses new packets, which would drop them.
+            match self.decoder.receive_frame(&mut decoded) {
+                Ok(()) => {
+                    let frame = decode_frame::<T>(&self.video_details, &decoded)?;
+                    self.frameno += 1;
+                    return Ok(Some(frame));
+                }
+                Err(ffmpeg::Error::Eof) => return Ok(None),
+                // EAGAIN: the decoder needs another packet first.
+                Err(ffmpeg::Error::Other { errno })
+                    if io::Error::from_raw_os_error(errno).kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) if self.eof_sent => return Err(e.into()),
+                // A frame that failed to decode is skipped, as before.
+                Err(_) => {}
+            }
+
+            if self.eof_sent {
+                return Ok(None);
+            }
+
             let packet = self
                 .input_ctx
                 .packets()
                 .next()
                 .and_then(Result::ok)
                 .map(|(_, pkt)| pkt);
-
-            let mut packet = if let Some(pkt) = packet {
-                pkt
-            } else {
-                self.end_of_stream = true;
-                packet::Packet::empty()
-            };
-
-            if self.end_of_stream && !self.eof_sent {
-                let _ = self.decoder.send_eof();
-                self.eof_sent = true;
-            }
-
-            if self.end_of_stream || packet.stream() == self.stream_index {
-                let mut decoded = frame::Video::new(
-                    self.decoder.format(),
-                    self.video_details.width as u32,
-                    self.video_details.height as u32,
-                );
-                packet.set_pts(Some(self.frameno as i64));
-                packet.set_dts(Some(self.frameno as i64));
-
-                if !self.end_of_stream {
+            match packet {
+                Some(packet) if packet.stream() == self.stream_index => {
                     let _ = self.decoder.send_packet(&packet);
                 }
-
-                if self.decoder.receive_frame(&mut decoded).is_ok() {
-                    let frame = decode_frame::<T>(&self.video_details, &decoded)?;
-                    self.frameno += 1;
-                    return Ok(Some(frame));
-                } else if self.end_of_stream {
-                    return Ok(None);
+                Some(_) => {}
+                None => {
+                    self.end_of_stream = true;
+                    let _ = self.decoder.send_eof();
+                    self.eof_sent = true;
                 }
             }
         }

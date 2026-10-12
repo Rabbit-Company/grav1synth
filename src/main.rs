@@ -514,8 +514,15 @@ pub fn main() -> Result<()> {
                 ProgressBar::hidden()
             };
 
-            let mut source_reader = BitstreamReader::open(&source)?;
-            let mut denoised_reader = BitstreamReader::open(&denoised)?;
+            let threads = threads.unwrap_or_else(|| {
+                std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+            });
+            // The two decoders run side by side, so each gets half of the thread budget.
+            let decoder_threads = threads.div_ceil(2).min(16);
+            let mut source_reader =
+                BitstreamReader::open_with_decoder_threads(&source, decoder_threads)?;
+            let mut denoised_reader =
+                BitstreamReader::open_with_decoder_threads(&denoised, decoder_threads)?;
             let frame_rate = source_reader.get_video_details().frame_rate;
             let source_bd = source_reader.get_video_details().bit_depth;
             let denoised_bd = denoised_reader.get_video_details().bit_depth;
@@ -526,9 +533,7 @@ pub fn main() -> Result<()> {
                 ),
                 source_bd,
                 denoised_bd,
-                threads.unwrap_or_else(|| {
-                    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
-                }),
+                threads,
                 noise_sampling
                     .map(NoiseSampling::sample_step)
                     .or_else(|| accuracy.map(DiffAccuracy::sample_step))
@@ -1006,6 +1011,7 @@ pub enum Commands {
         #[clap(long, short, verbatim_doc_comment)]
         filters: Option<String>,
         /// Number of threads for grain analysis (default: all available CPU threads).
+        /// Each of the two video decoders also uses up to half this many threads.
         #[clap(long)]
         threads: Option<usize>,
         /// Number of frames in the source, used only for the progress bar.
