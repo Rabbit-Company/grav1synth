@@ -1,3 +1,8 @@
+## Version 0.3.2
+
+- Reduce work in `diff`'s noise equation loop by reusing the normalization factor
+  and filling the symmetric half of each equation matrix after accumulation.
+
 ## Version 0.3.1
 
 - Decode the source and denoised video concurrently with grain analysis. Frame pairs still

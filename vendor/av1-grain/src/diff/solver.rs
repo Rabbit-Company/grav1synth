@@ -799,6 +799,8 @@ impl NoiseModel {
         let alt_stride = alt_source.map_or(0, |s| s.geometry().stride.get());
         let alt_source_origin = alt_source.map(|s| get_dbg(s.data(), s.data_origin()..));
         let alt_denoised_origin = alt_denoised.map(|s| get_dbg(s.data(), s.data_origin()..));
+        // Avoid dividing every matrix contribution inside the pixel loop.
+        let inverse_normalization = 1.0 / BLOCK_NORMALIZATION.powi(2);
 
         let calculate = |start_by: usize, end_by: usize| {
             let mut a = vec![0f64; n * n];
@@ -852,19 +854,22 @@ impl NoiseModel {
                                 for i in 0..n {
                                     for j in 0..=i {
                                         let value = (*get_dbg(&buffer, i) * *get_dbg(&buffer, j))
-                                            / BLOCK_NORMALIZATION.powi(2);
+                                            * inverse_normalization;
                                         *get_dbg_mut(&mut a, i * n + j) += value;
-                                        if i != j {
-                                            *get_dbg_mut(&mut a, j * n + i) += value;
-                                        }
                                     }
                                     *get_dbg_mut(&mut b, i) +=
-                                        (*get_dbg(&buffer, i) * val) / BLOCK_NORMALIZATION.powi(2);
+                                        (*get_dbg(&buffer, i) * val) * inverse_normalization;
                                 }
                                 observations += 1;
                             }
                         }
                     }
+                }
+            }
+            // Every cross-product has the same value on both sides of the diagonal.
+            for i in 1..n {
+                for j in 0..i {
+                    *get_dbg_mut(&mut a, j * n + i) = *get_dbg(&a, i * n + j);
                 }
             }
             (a, b, observations)
