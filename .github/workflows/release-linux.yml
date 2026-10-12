@@ -17,6 +17,8 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: write
+    env:
+      DEBIAN_FRONTEND: noninteractive
     steps:
       - name: Install tools and deb-multimedia repository
         run: |
@@ -35,7 +37,7 @@ jobs:
           EOF
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential cargo rustc pkg-config clang libclang-dev zstd gh \
+            build-essential cargo rustc pkg-config clang libclang-dev zstd \
             ffmpeg libavc1394-0 libraw1394-11 libiec61883-0 libdc1394-25 \
             libtesseract5 libxml2-16 libbz2-1.0 libbluray4 libvpx12 \
             libdavs2-16 libshine3 libsvtav1enc4 libtheoraenc2 \
@@ -52,7 +54,8 @@ jobs:
           if-no-files-found: error
       - name: Attach files to the published release
         if: github.event_name == 'release'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$RELEASE_TAG" dist/* --clobber
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.event.release.tag_name }}
+          files: dist/*
+          fail_on_unmatched_files: true
