@@ -9,4 +9,6 @@ Grav1synth uses this local copy because `diff` spends most of its time inside
 the dependency's noise-model solver. The changes in `src/diff.rs` and
 `src/diff/solver.rs` add a per-generator thread count and process independent
 block rows concurrently, then combine their results in row order. Frame order
-and the noise model's state remain serial. Other crate behavior is unchanged.
+and the noise model's state remain serial. The solver also calculates only the
+unique half of each symmetric noise equation matrix. Other crate behavior is
+unchanged.

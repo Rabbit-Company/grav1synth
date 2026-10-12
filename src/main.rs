@@ -10,6 +10,7 @@ use std::{
     io::{BufWriter, Write, stderr},
     num::NonZeroU8,
     path::PathBuf,
+    sync::mpsc::sync_channel,
     time::Duration,
 };
 
@@ -491,97 +492,84 @@ pub fn main() -> Result<()> {
             let non_zero_source_bd =
                 NonZeroU8::new(source_bd as u8).ok_or_else(|| anyhow!("bd should not be 0"))?;
 
-            let mut frames = 0usize;
-            loop {
-                debug!("Diffing next frame");
-                match (source_bd, denoised_bd) {
-                    (8, 8) => match get_filtered_frame_pair::<u8, u8>(
+            // Decode both inputs ahead while the grain model analyzes the previous pair.
+            // Bounded channels keep memory use predictable and preserve each stream's order.
+            let (source_sender, source_receiver) = sync_channel::<Result<DecodedFrame>>(2);
+            let (denoised_sender, denoised_receiver) = sync_channel::<Result<DecodedFrame>>(2);
+            let source_producer = std::thread::spawn(move || {
+                loop {
+                    let frame = read_diff_frame(
                         &mut source_reader,
-                        &mut denoised_reader,
-                        non_zero_source_bd,
+                        source_bd,
                         filters.as_ref(),
-                    )? {
-                        (Some(source_frame), Some(denoised_frame)) => {
-                            differ.diff_frame(&source_frame, &denoised_frame)?;
-                        }
-                        (None, None) => {
-                            break;
-                        }
-                        _ => {
-                            warn!(
-                                "Videos did not have equal frame counts. Resulting grain table \
-                                 may not be as expected."
-                            );
-                            break;
-                        }
-                    },
-                    (8, 9..=16) => match get_filtered_frame_pair::<u8, u16>(
-                        &mut source_reader,
-                        &mut denoised_reader,
                         non_zero_source_bd,
-                        filters.as_ref(),
-                    )? {
-                        (Some(source_frame), Some(denoised_frame)) => {
-                            differ.diff_frame(&source_frame, &denoised_frame)?;
-                        }
-                        (None, None) => {
-                            break;
-                        }
-                        _ => {
-                            warn!(
-                                "Videos did not have equal frame counts. Resulting grain table \
-                                 may not be as expected."
-                            );
-                            break;
-                        }
-                    },
-                    (9..=16, 8) => match get_filtered_frame_pair::<u16, u8>(
-                        &mut source_reader,
-                        &mut denoised_reader,
-                        non_zero_source_bd,
-                        filters.as_ref(),
-                    )? {
-                        (Some(source_frame), Some(denoised_frame)) => {
-                            differ.diff_frame(&source_frame, &denoised_frame)?;
-                        }
-                        (None, None) => {
-                            break;
-                        }
-                        _ => {
-                            warn!(
-                                "Videos did not have equal frame counts. Resulting grain table \
-                                 may not be as expected."
-                            );
-                            break;
-                        }
-                    },
-                    (9..=16, 9..=16) => match get_filtered_frame_pair::<u16, u16>(
-                        &mut source_reader,
-                        &mut denoised_reader,
-                        non_zero_source_bd,
-                        filters.as_ref(),
-                    )? {
-                        (Some(source_frame), Some(denoised_frame)) => {
-                            differ.diff_frame(&source_frame, &denoised_frame)?;
-                        }
-                        (None, None) => {
-                            break;
-                        }
-                        _ => {
-                            warn!(
-                                "Videos did not have equal frame counts. Resulting grain table \
-                                 may not be as expected."
-                            );
-                            break;
-                        }
-                    },
-                    _ => {
-                        bail!("Bit depths not between 8-16 are not currently supported");
+                    );
+                    let done = matches!(&frame, Ok(DecodedFrame::End) | Err(_));
+                    if source_sender.send(frame).is_err() || done {
+                        break;
                     }
                 }
-                frames += 1;
-                progress.inc(1);
-            }
+            });
+            let denoised_producer = std::thread::spawn(move || {
+                loop {
+                    let frame = read_diff_frame(
+                        &mut denoised_reader,
+                        denoised_bd,
+                        None,
+                        non_zero_source_bd,
+                    );
+                    let done = matches!(&frame, Ok(DecodedFrame::End) | Err(_));
+                    if denoised_sender.send(frame).is_err() || done {
+                        break;
+                    }
+                }
+            });
+            let consume_result = (|| -> Result<usize> {
+                let mut frames = 0usize;
+                loop {
+                    debug!("Diffing next frame");
+                    let source_frame = source_receiver
+                        .recv()
+                        .map_err(|_| anyhow!("Source decoder stopped before end of input"))??;
+                    let denoised_frame = denoised_receiver
+                        .recv()
+                        .map_err(|_| anyhow!("Denoised decoder stopped before end of input"))??;
+                    match (source_frame, denoised_frame) {
+                        (DecodedFrame::U8(source), DecodedFrame::U8(denoised)) => {
+                            differ.diff_frame(&source, &denoised)?
+                        }
+                        (DecodedFrame::U8(source), DecodedFrame::U16(denoised)) => {
+                            differ.diff_frame(&source, &denoised)?
+                        }
+                        (DecodedFrame::U16(source), DecodedFrame::U8(denoised)) => {
+                            differ.diff_frame(&source, &denoised)?
+                        }
+                        (DecodedFrame::U16(source), DecodedFrame::U16(denoised)) => {
+                            differ.diff_frame(&source, &denoised)?
+                        }
+                        (DecodedFrame::End, DecodedFrame::End) => break,
+                        _ => {
+                            warn!(
+                                "Videos did not have equal frame counts. Resulting grain table \
+                                 may not be as expected."
+                            );
+                            break;
+                        }
+                    }
+                    frames += 1;
+                    progress.inc(1);
+                }
+                Ok(frames)
+            })();
+            drop(source_receiver);
+            drop(denoised_receiver);
+            source_producer
+                .join()
+                .map_err(|_| anyhow!("Source decoder thread panicked"))?;
+            denoised_producer
+                .join()
+                .map_err(|_| anyhow!("Denoised decoder thread panicked"))?;
+            let frames = consume_result?;
             progress.finish();
 
             let grain_tables = differ.finish();
@@ -674,21 +662,43 @@ pub fn main() -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::type_complexity)]
-fn get_filtered_frame_pair<T: Pixel, U: Pixel>(
-    source_reader: &mut BitstreamReader,
-    denoised_reader: &mut BitstreamReader,
-    source_bd: NonZeroU8,
-    filters: Option<&FilterChain>,
-) -> Result<(Option<Frame<T>>, Option<Frame<U>>)> {
-    let mut frame = source_reader.get_frame::<T>();
-    if let Some(f) = filters.as_ref() {
-        frame = frame.map(|opt| opt.map(|source_frame| f.apply(source_frame, source_bd)));
-    }
-    let source_frame = frame;
-    let denoised_frame = denoised_reader.get_frame::<U>();
+enum DecodedFrame {
+    U8(Frame<u8>),
+    U16(Frame<u16>),
+    End,
+}
 
-    Ok((source_frame?, denoised_frame?))
+fn apply_diff_filter<T: Pixel>(
+    frame: Frame<T>,
+    filters: Option<&FilterChain>,
+    source_bit_depth: NonZeroU8,
+) -> Frame<T> {
+    if let Some(filters) = filters {
+        filters.apply(frame, source_bit_depth)
+    } else {
+        frame
+    }
+}
+
+fn read_diff_frame(
+    reader: &mut BitstreamReader,
+    bit_depth: usize,
+    filters: Option<&FilterChain>,
+    source_bit_depth: NonZeroU8,
+) -> Result<DecodedFrame> {
+    match bit_depth {
+        8 => reader.get_frame::<u8>().map(|frame| {
+            frame.map_or(DecodedFrame::End, |frame| {
+                DecodedFrame::U8(apply_diff_filter(frame, filters, source_bit_depth))
+            })
+        }),
+        9..=16 => reader.get_frame::<u16>().map(|frame| {
+            frame.map_or(DecodedFrame::End, |frame| {
+                DecodedFrame::U16(apply_diff_filter(frame, filters, source_bit_depth))
+            })
+        }),
+        _ => bail!("Bit depths not between 8-16 are not currently supported"),
+    }
 }
 
 fn write_film_grain_segment(

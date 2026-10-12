@@ -1,3 +1,9 @@
+## Version 0.3.1
+
+- Decode the source and denoised video concurrently with grain analysis. Frame pairs still
+  reach the noise model in their original order, and decode buffering stays bounded.
+- Calculate each symmetric noise equation once, reducing CPU work in the `diff` hot path.
+
 ## Version 0.3.0
 
 - Merge `apply` and `generate` into a single `apply` command. `--grain <FILE>` applies

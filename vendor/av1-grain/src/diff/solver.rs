@@ -850,10 +850,13 @@ impl NoiseModel {
                                     &mut buffer,
                                 );
                                 for i in 0..n {
-                                    for j in 0..n {
-                                        *get_dbg_mut(&mut a, i * n + j) += (*get_dbg(&buffer, i)
-                                            * *get_dbg(&buffer, j))
+                                    for j in 0..=i {
+                                        let value = (*get_dbg(&buffer, i) * *get_dbg(&buffer, j))
                                             / BLOCK_NORMALIZATION.powi(2);
+                                        *get_dbg_mut(&mut a, i * n + j) += value;
+                                        if i != j {
+                                            *get_dbg_mut(&mut a, j * n + i) += value;
+                                        }
                                     }
                                     *get_dbg_mut(&mut b, i) +=
                                         (*get_dbg(&buffer, i) * val) / BLOCK_NORMALIZATION.powi(2);
