@@ -1,7 +1,5 @@
 # Grav1synth
 
-[![docs.rs](https://img.shields.io/docsrs/grav1synth?style=for-the-badge)](https://docs.rs/grav1synth)
-[![Crates.io](https://img.shields.io/crates/v/grav1synth?style=for-the-badge)](https://crates.io/crates/grav1synth)
 [![LICENSE](https://img.shields.io/crates/l/grav1synth?style=for-the-badge)](https://github.com/Rabbit-Company/grav1synth/blob/main/LICENSE)
 
 Grain Synth analyzer and editor for AV1 files
