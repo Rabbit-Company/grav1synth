@@ -10,7 +10,7 @@ use std::{
     io::{BufWriter, Write, stderr},
     num::NonZeroU8,
     path::PathBuf,
-    sync::mpsc::{TryRecvError, sync_channel},
+    sync::mpsc::sync_channel,
     time::Duration,
 };
 
@@ -542,20 +542,10 @@ pub fn main() -> Result<()> {
             let non_zero_source_bd =
                 NonZeroU8::new(source_bd as u8).ok_or_else(|| anyhow!("bd should not be 0"))?;
 
-            // Several frame pairs are analyzed at once and added to the model in order.
-            // One pair keeps a few threads busy, so this is what fills the CPU.
-            let batch_size = if threads > 1 {
-                threads.div_ceil(2).min(8)
-            } else {
-                1
-            };
-
-            // Decode both inputs ahead while the grain model analyzes earlier pairs.
-            // Bounded channels keep memory use predictable and preserve each stream's order.
-            let (source_sender, source_receiver) =
-                sync_channel::<Result<Option<Frame<u8>>>>(batch_size);
-            let (denoised_sender, denoised_receiver) =
-                sync_channel::<Result<Option<Frame<u8>>>>(batch_size);
+            // Decode both inputs ahead of the grain analysis. Bounded channels keep
+            // memory use predictable and preserve each stream's order.
+            let (source_sender, source_receiver) = sync_channel::<Result<Option<Frame<u8>>>>(2);
+            let (denoised_sender, denoised_receiver) = sync_channel::<Result<Option<Frame<u8>>>>(2);
             let source_producer = std::thread::spawn(move || {
                 loop {
                     let frame = read_diff_frame(
@@ -584,55 +574,30 @@ pub fn main() -> Result<()> {
                     }
                 }
             });
-            let consume_result = (|| -> Result<usize> {
-                let mut frames = 0usize;
-                let mut batch = Vec::with_capacity(batch_size);
-                let mut done = false;
-                while !done {
-                    batch.clear();
-                    while batch.len() < batch_size {
-                        // Wait for the first pair, then take only what is already decoded.
-                        let source_frame = if batch.is_empty() {
-                            source_receiver.recv().map_err(|_| {
-                                anyhow!("Source decoder stopped before end of input")
-                            })??
-                        } else {
-                            match source_receiver.try_recv() {
-                                Ok(frame) => frame?,
-                                Err(TryRecvError::Empty) => break,
-                                Err(TryRecvError::Disconnected) => {
-                                    bail!("Source decoder stopped before end of input")
-                                }
-                            }
-                        };
-                        let denoised_frame = denoised_receiver.recv().map_err(|_| {
-                            anyhow!("Denoised decoder stopped before end of input")
-                        })??;
-                        match (source_frame, denoised_frame) {
-                            (Some(source), Some(denoised)) => batch.push((source, denoised)),
-                            (None, None) => {
-                                done = true;
-                                break;
-                            }
-                            _ => {
-                                warn!(
-                                    "Videos did not have equal frame counts. Resulting grain \
-                                     table may not be as expected."
-                                );
-                                done = true;
-                                break;
-                            }
-                        }
+            let pairs = std::iter::from_fn(move || {
+                debug!("Diffing next frame");
+                let source_frame = source_receiver
+                    .recv()
+                    .map_err(|_| anyhow!("Source decoder stopped before end of input"))
+                    .flatten();
+                let denoised_frame = denoised_receiver
+                    .recv()
+                    .map_err(|_| anyhow!("Denoised decoder stopped before end of input"))
+                    .flatten();
+                match (source_frame, denoised_frame) {
+                    (Ok(Some(source)), Ok(Some(denoised))) => Some(Ok((source, denoised))),
+                    (Ok(None), Ok(None)) => None,
+                    (Err(error), _) | (_, Err(error)) => Some(Err(error)),
+                    _ => {
+                        warn!(
+                            "Videos did not have equal frame counts. Resulting grain table \
+                             may not be as expected."
+                        );
+                        None
                     }
-                    debug!("Diffing next {} frames", batch.len());
-                    differ.diff_frames(&batch)?;
-                    frames += batch.len();
-                    progress.inc(batch.len() as u64);
                 }
-                Ok(frames)
-            })();
-            drop(source_receiver);
-            drop(denoised_receiver);
+            });
+            let consume_result = differ.diff_frames(pairs, || progress.inc(1));
             source_producer
                 .join()
                 .map_err(|_| anyhow!("Source decoder thread panicked"))?;

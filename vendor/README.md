@@ -7,11 +7,14 @@ and its BSD-2-Clause license is included in `av1-grain/LICENSE`.
 
 Grav1synth uses this local copy because `diff` spends most of its time inside
 the dependency's noise-model solver. The changes in `src/diff.rs` and
-`src/diff/solver.rs` add a per-generator thread count and process independent
-block rows concurrently, then combine their results in row order. Frame order
-and the noise model's state remain serial. The solver also calculates only the
-unique half of each symmetric noise equation matrix. Its hot loop reuses one
-reciprocal normalization factor and copies the symmetric matrix entries once
-per worker instead of once per pixel. The `diff --accuracy` modes sample noise
+`src/diff/solver.rs` split the analysis of a frame into a part that reads no
+model state and a part that updates the model. Worker threads run the first
+part for several frames at once, one thread per plane, and the generator adds
+the results to the model in frame order. Each plane is summed in the original
+block order, so the table is the same as the unpatched crate's for every thread
+count. The solver also calculates only the unique half of each symmetric noise
+equation matrix, and replaces the division of each contribution with a multiply
+and one FMA correction step that gives the same quotient (a unit test checks
+every possible contribution). The `diff --accuracy` modes sample noise
 equation observations in this solver. The default sample step of one preserves
 the full v0.3.2 analysis. Other crate behavior is unchanged.

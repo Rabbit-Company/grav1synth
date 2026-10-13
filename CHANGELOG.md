@@ -1,3 +1,19 @@
+## Version 0.3.8
+
+- Make the `diff` table independent of `--threads` and identical to the one rust-av
+  grav1synth writes. Two things made earlier releases differ:
+  - Block rows of a plane were summed on several threads and combined afterwards, which
+    changed the order of the floating point additions. Each plane of a frame is now
+    summed by one thread in block order. The threads work on different frames and planes.
+  - The solver multiplied by a reciprocal where the reference divides. It now uses a
+    multiply with one FMA correction step that gives the exact quotient, or a division on
+    CPUs without FMA. This affected every thread count, including `--threads 1`.
+- Analyze frames as a continuous pipeline. Frames are analyzed as they are decoded and
+  added to the noise model in order. The block noise measurements moved into the parallel
+  step, so a finished frame no longer keeps its pixels while it waits for its turn.
+- `--noise-sampling half` and `quarter` now also give one table for every thread count,
+  the one earlier releases wrote with `--threads 1`.
+
 ## Version 0.3.7
 
 - Analyze several frame pairs at once in `diff` and add them to the noise model in order.

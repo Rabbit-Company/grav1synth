@@ -45,7 +45,7 @@ Reads `my_encode.mkv`, removes all synthesized film grain, and outputs the video
 
 Compares `my_source.mkv` and `denoised_source.mkv` and generates a film grain table at `grain_file.txt` based on the difference between them. This will provide the most accurate estimation of source film grain.
 
-The `diff` command uses all available CPU threads for grain analysis by default. Use `--threads 8` (or another positive number) to limit its CPU use when other work, such as encoding, runs at the same time. Each of the two video decoders also uses up to half that many threads. Frames are still analyzed in order.
+The `diff` command uses all available CPU threads for grain analysis by default. Use `--threads 8` (or another positive number) to limit its CPU use when other work, such as encoding, runs at the same time. Each of the two video decoders also uses up to half that many threads. The table does not depend on the thread count.
 
 Before it starts, `diff` reads the whole source once to count frames for the progress bar. Pass `--frames N` when you already know the count to skip that step. The value only affects the progress bar and ETA, never the table.
 

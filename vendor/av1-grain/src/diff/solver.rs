@@ -20,6 +20,31 @@ use crate::{
 const LOW_POLY_NUM_PARAMS: usize = 3;
 const NOISE_MODEL_LAG: usize = 3;
 const BLOCK_NORMALIZATION: f64 = 255.0f64;
+/// Every contribution to the noise equations is divided by this.
+const EQUATION_NORMALIZATION: f64 = BLOCK_NORMALIZATION * BLOCK_NORMALIZATION;
+const INVERSE_EQUATION_NORMALIZATION: f64 = 1.0 / EQUATION_NORMALIZATION;
+/// Equation contributions are multiples of 1/16 up to this many sixteenths: products of
+/// two 8-bit pixel differences, where chroma adds a luma difference averaged over up to
+/// four pixels.
+#[cfg(test)]
+const MAX_CONTRIBUTION_SIXTEENTHS: i32 = 255 * 255 * 16;
+
+/// Divides an equation contribution by the normalization, as the reference solver does.
+#[inline(always)]
+fn normalize_by_division(contribution: f64) -> f64 {
+    contribution / EQUATION_NORMALIZATION
+}
+
+/// Gives the same result as [`normalize_by_division`] without dividing. Multiplying by
+/// the reciprocal alone rounds some contributions differently, which is enough to move
+/// scaling points in the table. One correction step from the exact remainder fixes
+/// that. The test below checks every contribution the solver can produce.
+#[inline(always)]
+fn normalize_with_fma(contribution: f64) -> f64 {
+    let quotient = contribution * INVERSE_EQUATION_NORMALIZATION;
+    let remainder = quotient.mul_add(-EQUATION_NORMALIZATION, contribution);
+    remainder.mul_add(INVERSE_EQUATION_NORMALIZATION, quotient)
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct FlatBlockFinder {
@@ -384,9 +409,6 @@ pub(super) struct NoiseModel {
     combined_state: [NoiseModelState; 3],
     latest_state: [NoiseModelState; 3],
     n: usize,
-    coords: Vec<[isize; 2]>,
-    pool: Option<ThreadPool>,
-    pool_threads: usize,
 }
 
 struct ObservationWorker {
@@ -412,13 +434,181 @@ impl ObservationWorker {
 pub(super) struct FrameObservations {
     flat_blocks: Vec<u8>,
     num_flat_blocks: usize,
-    /// Per channel, one accumulator for each row partition.
-    channels: [Vec<ObservationWorker>; 3],
+    /// One accumulator per channel, empty when the frame was not observed.
+    channels: [Option<ObservationWorker>; 3],
+    /// Per channel, the mean and noise variance of each usable flat block in block order.
+    block_noise: [Vec<(f64, f64)>; 3],
+    num_channels: usize,
 }
 
 impl FrameObservations {
     pub const fn num_flat_blocks(&self) -> usize {
         self.num_flat_blocks
+    }
+}
+
+/// Does the part of the analysis that needs no noise model state. Worker threads can
+/// observe frames while another thread adds earlier ones to the model.
+pub(super) struct FrameObserver {
+    flat_block_finder: FlatBlockFinder,
+    n: usize,
+    coords: Vec<[isize; 2]>,
+    pool: Option<ThreadPool>,
+}
+
+impl FrameObserver {
+    /// Creates an observer with a pool of `threads` workers, or none for a single thread.
+    #[must_use]
+    pub fn new(threads: usize) -> Self {
+        let n = NoiseModel::num_coeffs();
+        let mut coords = Vec::new();
+
+        let neg_lag = -(NOISE_MODEL_LAG as isize);
+        for y in neg_lag..=0 {
+            let max_x = if y == 0 {
+                -1isize
+            } else {
+                NOISE_MODEL_LAG as isize
+            };
+            for x in neg_lag..=max_x {
+                coords.push([x, y]);
+            }
+        }
+        assert!(n == coords.len());
+
+        Self {
+            flat_block_finder: FlatBlockFinder::new(),
+            n,
+            coords,
+            pool: (threads > 1).then(|| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .expect("failed to create grain worker pool")
+            }),
+        }
+    }
+
+    pub const fn pool(&self) -> Option<&ThreadPool> {
+        self.pool.as_ref()
+    }
+
+    /// Finds the flat blocks of a frame and accumulates their noise equations.
+    /// This reads no model state, so several frames can be observed at once.
+    pub fn observe(
+        &self,
+        source: &Frame<u8>,
+        denoised: &Frame<u8>,
+        sample_step: usize,
+        frame_index: usize,
+    ) -> FrameObservations {
+        let pool = self.pool.as_ref();
+        let (flat_blocks, num_flat_blocks) = self.flat_block_finder.run(&source.y_plane, pool);
+        let mut observations = FrameObservations {
+            flat_blocks,
+            num_flat_blocks,
+            channels: [None, None, None],
+            block_noise: [Vec::new(), Vec::new(), Vec::new()],
+            num_channels: if source.subsampling == ChromaSubsampling::Monochrome {
+                1
+            } else {
+                3
+            },
+        };
+        // The model rejects such frames before it looks at any observation.
+        if observations.flat_blocks.iter().filter(|b| **b > 0).count() <= 1 {
+            return observations;
+        }
+
+        let num_blocks_w = source.y_plane.width().get().div_ceil(BLOCK_SIZE);
+        let num_blocks_h = source.y_plane.height().get().div_ceil(BLOCK_SIZE);
+        let frame_dims = (source.y_plane.width().get(), source.y_plane.height().get());
+        let num_channels = observations.num_channels;
+        let mut jobs = ArrayVec::<BlockObservationJob<'_>, 3>::new();
+        for channel in 0..num_channels {
+            let (source_plane, denoised_plane) = match channel {
+                0 => (&source.y_plane, &denoised.y_plane),
+                1 => (
+                    source
+                        .u_plane
+                        .as_ref()
+                        .expect("unreachable due to loop bounds"),
+                    denoised
+                        .u_plane
+                        .as_ref()
+                        .expect("unreachable due to loop bounds"),
+                ),
+                _ => (
+                    source
+                        .v_plane
+                        .as_ref()
+                        .expect("unreachable due to loop bounds"),
+                    denoised
+                        .v_plane
+                        .as_ref()
+                        .expect("unreachable due to loop bounds"),
+                ),
+            };
+            let alt_source = (channel > 0).then_some(&source.y_plane);
+            let alt_denoised = (channel > 0).then_some(&denoised.y_plane);
+            // Chroma has one more coefficient, for its correlation with luma.
+            let n = self.n + usize::from(channel > 0);
+            *get_dbg_mut(&mut observations.channels, channel) =
+                Some(ObservationWorker::new(n, self.n));
+            jobs.push(BlockObservationJob {
+                coords: &self.coords,
+                num_coords: self.n,
+                n,
+                block_w: BLOCK_SIZE / source_plane.geometry().subsampling_x.get() as usize,
+                block_h: BLOCK_SIZE / source_plane.geometry().subsampling_y.get() as usize,
+                dec: (
+                    source_plane.geometry().subsampling_x.get() as usize >> 1,
+                    source_plane.geometry().subsampling_y.get() as usize >> 1,
+                ),
+                stride: source_plane.geometry().stride.get(),
+                source_origin: get_dbg(source_plane.data(), source_plane.data_origin()..),
+                denoised_origin: get_dbg(denoised_plane.data(), denoised_plane.data_origin()..),
+                alt_stride: alt_source.map_or(0, |s| s.geometry().stride.get()),
+                alt_source_origin: alt_source.map(|s| get_dbg(s.data(), s.data_origin()..)),
+                alt_denoised_origin: alt_denoised.map(|s| get_dbg(s.data(), s.data_origin()..)),
+                frame_dims,
+                flat_blocks: &observations.flat_blocks,
+                num_blocks_w,
+                sample_step,
+                frame_index,
+                source: source_plane,
+                denoised: denoised_plane,
+                alt_source,
+            });
+        }
+
+        // Each channel is summed by one thread in block order. Splitting a channel
+        // would change the order of the floating point additions, and with it the table.
+        let outputs = observations
+            .channels
+            .iter_mut()
+            .flatten()
+            .zip(observations.block_noise.iter_mut());
+        let run =
+            |job: &BlockObservationJob<'_>,
+             (worker, block_noise): (&mut ObservationWorker, &mut Vec<(f64, f64)>)| {
+                job.calculate(0, num_blocks_h, worker);
+                *block_noise = job.measure_block_noise(num_blocks_h);
+            };
+        if let Some(pool) = pool {
+            pool.scope(|scope| {
+                for (job, output) in jobs.iter().zip(outputs) {
+                    scope.spawn(move |_| run(job, output));
+                }
+            });
+        } else {
+            for (job, output) in jobs.iter().zip(outputs) {
+                run(job, output);
+            }
+        }
+        drop(jobs);
+
+        observations
     }
 }
 
@@ -436,64 +626,15 @@ impl NoiseModel {
             NoiseModelState::new(n + 1),
             NoiseModelState::new(n + 1),
         ];
-        let mut coords = Vec::new();
-
-        let neg_lag = -(NOISE_MODEL_LAG as isize);
-        for y in neg_lag..=0 {
-            let max_x = if y == 0 {
-                -1isize
-            } else {
-                NOISE_MODEL_LAG as isize
-            };
-            for x in neg_lag..=max_x {
-                coords.push([x, y]);
-            }
-        }
-        assert!(n == coords.len());
-
         Self {
             combined_state,
             latest_state,
             n,
-            coords,
-            pool: None,
-            pool_threads: 0,
         }
     }
 
-    pub const fn pool(&self) -> Option<&ThreadPool> {
-        self.pool.as_ref()
-    }
-
-    pub fn worker_pool(&mut self, threads: usize) -> Option<&ThreadPool> {
-        if threads <= 1 {
-            return None;
-        }
-        self.ensure_pool(threads);
-        self.pool.as_ref()
-    }
-
-    fn ensure_pool(&mut self, threads: usize) {
-        if threads > 1 && self.pool_threads != threads {
-            self.pool = Some(
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(threads)
-                    .build()
-                    .expect("failed to create grain worker pool"),
-            );
-            self.pool_threads = threads;
-        }
-    }
-
-    pub fn update(
-        &mut self,
-        source: &Frame<u8>,
-        denoised: &Frame<u8>,
-        observations: &FrameObservations,
-    ) -> NoiseStatus {
+    pub fn update(&mut self, observations: &FrameObservations) -> NoiseStatus {
         let flat_blocks = observations.flat_blocks.as_slice();
-        let num_blocks_w = source.y_plane.width().get().div_ceil(BLOCK_SIZE);
-        let num_blocks_h = source.y_plane.height().get().div_ceil(BLOCK_SIZE);
         let mut y_model_different = false;
 
         // Clear the latest equation system
@@ -510,41 +651,10 @@ impl NoiseModel {
             return NoiseStatus::Error(anyhow!("Not enough flat blocks to update noise estimate"));
         }
 
-        let frame_dims = (source.y_plane.width().get(), source.y_plane.height().get());
-        for channel in 0..(if source.subsampling == ChromaSubsampling::Monochrome {
-            1
-        } else {
-            3
-        }) {
-            let source_plane = match channel {
-                0 => &source.y_plane,
-                1 => source
-                    .u_plane
-                    .as_ref()
-                    .expect("unreachable due to loop bounds"),
-                2 => source
-                    .v_plane
-                    .as_ref()
-                    .expect("unreachable due to loop bounds"),
-                _ => unreachable!(),
-            };
-            let denoised_plane = match channel {
-                0 => &denoised.y_plane,
-                1 => denoised
-                    .u_plane
-                    .as_ref()
-                    .expect("unreachable due to loop bounds"),
-                2 => denoised
-                    .v_plane
-                    .as_ref()
-                    .expect("unreachable due to loop bounds"),
-                _ => unreachable!(),
-            };
+        for channel in 0..observations.num_channels {
             let is_chroma = channel > 0;
-            let alt_source = (channel > 0).then_some(&source.y_plane);
-            // Add the partitions in order, so the sums match a frame observed on its own.
             let state = get_dbg_mut(&mut self.latest_state, channel);
-            for worker in get_dbg(&observations.channels, channel) {
+            if let Some(worker) = get_dbg(&observations.channels, channel) {
                 for (sum, value) in state.eqns.a.iter_mut().zip(&worker.a) {
                     *sum += *value;
                 }
@@ -566,16 +676,7 @@ impl NoiseModel {
                     ));
                 }
             }
-            self.add_noise_std_observations(
-                channel,
-                source_plane,
-                denoised_plane,
-                alt_source,
-                frame_dims,
-                flat_blocks,
-                num_blocks_w,
-                num_blocks_h,
-            );
+            self.add_noise_std_observations(channel, get_dbg(&observations.block_noise, channel));
             if !get_dbg_mut(&mut self.latest_state, channel)
                 .strength_solver
                 .solve()
@@ -858,210 +959,39 @@ impl NoiseModel {
         diff * dx / total_weight > STRENGTH_THRESHOLD
     }
 
-    /// Finds the flat blocks of a frame and accumulates their noise equations.
-    /// This reads no model state, so several frames can be observed at once.
-    pub fn observe(
-        &self,
-        flat_block_finder: &FlatBlockFinder,
-        source: &Frame<u8>,
-        denoised: &Frame<u8>,
-        threads: usize,
-        sample_step: usize,
-        frame_index: usize,
-    ) -> FrameObservations {
-        let pool = if threads > 1 {
-            self.pool.as_ref()
-        } else {
-            None
-        };
-        let (flat_blocks, num_flat_blocks) = flat_block_finder.run(&source.y_plane, pool);
-        let mut observations = FrameObservations {
-            flat_blocks,
-            num_flat_blocks,
-            channels: [Vec::new(), Vec::new(), Vec::new()],
-        };
-        // The model rejects such frames before it looks at any observation.
-        if observations.flat_blocks.iter().filter(|b| **b > 0).count() <= 1 {
-            return observations;
-        }
-
-        let num_blocks_w = source.y_plane.width().get().div_ceil(BLOCK_SIZE);
-        let num_blocks_h = source.y_plane.height().get().div_ceil(BLOCK_SIZE);
-        let frame_dims = (source.y_plane.width().get(), source.y_plane.height().get());
-        let num_channels = if source.subsampling == ChromaSubsampling::Monochrome {
-            1
-        } else {
-            3
-        };
-        let threads = threads.min(num_blocks_h.max(1));
-        let rows_per_thread = num_blocks_h.div_ceil(threads);
-        let job_count = num_blocks_h.div_ceil(rows_per_thread);
-
-        let mut jobs = ArrayVec::<BlockObservationJob<'_>, 3>::new();
-        for channel in 0..num_channels {
-            let (source_plane, denoised_plane) = match channel {
-                0 => (&source.y_plane, &denoised.y_plane),
-                1 => (
-                    source
-                        .u_plane
-                        .as_ref()
-                        .expect("unreachable due to loop bounds"),
-                    denoised
-                        .u_plane
-                        .as_ref()
-                        .expect("unreachable due to loop bounds"),
-                ),
-                _ => (
-                    source
-                        .v_plane
-                        .as_ref()
-                        .expect("unreachable due to loop bounds"),
-                    denoised
-                        .v_plane
-                        .as_ref()
-                        .expect("unreachable due to loop bounds"),
-                ),
-            };
-            let alt_source = (channel > 0).then_some(&source.y_plane);
-            let alt_denoised = (channel > 0).then_some(&denoised.y_plane);
-            let n = get_dbg(&self.latest_state, channel).eqns.n;
-            get_dbg_mut(&mut observations.channels, channel)
-                .resize_with(job_count, || ObservationWorker::new(n, self.n));
-            jobs.push(BlockObservationJob {
-                coords: &self.coords,
-                num_coords: self.n,
-                n,
-                block_w: BLOCK_SIZE / source_plane.geometry().subsampling_x.get() as usize,
-                block_h: BLOCK_SIZE / source_plane.geometry().subsampling_y.get() as usize,
-                dec: (
-                    source_plane.geometry().subsampling_x.get() as usize >> 1,
-                    source_plane.geometry().subsampling_y.get() as usize >> 1,
-                ),
-                stride: source_plane.geometry().stride.get(),
-                source_origin: get_dbg(source_plane.data(), source_plane.data_origin()..),
-                denoised_origin: get_dbg(denoised_plane.data(), denoised_plane.data_origin()..),
-                alt_stride: alt_source.map_or(0, |s| s.geometry().stride.get()),
-                alt_source_origin: alt_source.map(|s| get_dbg(s.data(), s.data_origin()..)),
-                alt_denoised_origin: alt_denoised.map(|s| get_dbg(s.data(), s.data_origin()..)),
-                frame_dims,
-                flat_blocks: &observations.flat_blocks,
-                num_blocks_w,
-                sample_step,
-                frame_index,
-            });
-        }
-
-        let row_range = |index: usize| {
-            let start = index * rows_per_thread;
-            (start, (start + rows_per_thread).min(num_blocks_h))
-        };
-        if let Some(pool) = pool {
-            // All channels share the pool, so short chroma partitions fill the gaps
-            // left by luma partitions with few flat blocks.
-            pool.scope(|scope| {
-                for (job, workers) in jobs.iter().zip(observations.channels.iter_mut()) {
-                    for (index, worker) in workers.iter_mut().enumerate() {
-                        let (start, end) = row_range(index);
-                        scope.spawn(move |_| job.calculate(start, end, worker));
-                    }
-                }
-            });
-        } else {
-            for (job, workers) in jobs.iter().zip(observations.channels.iter_mut()) {
-                for (index, worker) in workers.iter_mut().enumerate() {
-                    let (start, end) = row_range(index);
-                    job.calculate(start, end, worker);
-                }
-            }
-        }
-        drop(jobs);
-
-        observations
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn add_noise_std_observations(
-        &mut self,
-        channel: usize,
-        source: &Plane<u8>,
-        denoised: &Plane<u8>,
-        alt_source: Option<&Plane<u8>>,
-        frame_dims: (usize, usize),
-        flat_blocks: &[u8],
-        num_blocks_w: usize,
-        num_blocks_h: usize,
-    ) {
+    fn add_noise_std_observations(&mut self, channel: usize, block_noise: &[(f64, f64)]) {
         let num_coords = self.n;
         let luma_gain = self.latest_state[0].ar_gain;
         let noise_gain = get_dbg(&self.latest_state, channel).ar_gain;
-        let block_w = BLOCK_SIZE / source.geometry().subsampling_x.get() as usize;
-        let block_h = BLOCK_SIZE / source.geometry().subsampling_y.get() as usize;
 
-        for by in 0..num_blocks_h {
-            let y_o = by * block_h;
-            for bx in 0..num_blocks_w {
-                let x_o = bx * block_w;
-                if *get_dbg(flat_blocks, by * num_blocks_w + bx) == 0 {
-                    continue;
-                }
-                let num_samples_h = ((frame_dims.1
-                    / source.geometry().subsampling_y.get() as usize)
-                    - by * block_h)
-                    .min(block_h);
-                let num_samples_w = ((frame_dims.0
-                    / source.geometry().subsampling_x.get() as usize)
-                    - bx * block_w)
-                    .min(block_w);
-                // Make sure that we have a reasonable amount of samples to consider the
-                // block
-                if num_samples_w * num_samples_h > BLOCK_SIZE {
-                    let block_mean = get_block_mean(
-                        alt_source.unwrap_or(source),
-                        frame_dims,
-                        x_o << (source.geometry().subsampling_x.get() >> 1),
-                        y_o << (source.geometry().subsampling_y.get() >> 1),
-                    );
-                    let noise_var = get_noise_var(
-                        source,
-                        denoised,
-                        (
-                            frame_dims.0 >> (source.geometry().subsampling_x.get() >> 1),
-                            frame_dims.1 >> (source.geometry().subsampling_y.get() >> 1),
-                        ),
-                        x_o,
-                        y_o,
-                        block_w,
-                        block_h,
-                    );
-                    // We want to remove the part of the noise that came from being
-                    // correlated with luma. Note that the noise solver for luma must
-                    // have already been run.
-                    let luma_strength = if channel > 0 {
-                        luma_gain * self.latest_state[0].strength_solver.get_value(block_mean)
-                    } else {
-                        0f64
-                    };
-                    let corr = if channel > 0 {
-                        let coeffs = &get_dbg(&self.latest_state, channel).eqns.x;
-                        *get_dbg(coeffs, num_coords)
-                    } else {
-                        0f64
-                    };
-                    // Chroma noise:
-                    //    N(0, noise_var) = N(0, uncorr_var) + corr * N(0, luma_strength^2)
-                    // The uncorrelated component:
-                    //   uncorr_var = noise_var - (corr * luma_strength)^2
-                    // But don't allow fully correlated noise (hence the max), since the
-                    // synthesis cannot model it.
-                    let uncorr_std = (noise_var / 16f64)
-                        .max((corr * luma_strength).mul_add(-(corr * luma_strength), noise_var))
-                        .sqrt();
-                    let adjusted_strength = uncorr_std / noise_gain;
-                    get_dbg_mut(&mut self.latest_state, channel)
-                        .strength_solver
-                        .add_measurement(block_mean, adjusted_strength);
-                }
-            }
+        for &(block_mean, noise_var) in block_noise {
+            // We want to remove the part of the noise that came from being
+            // correlated with luma. Note that the noise solver for luma must
+            // have already been run.
+            let luma_strength = if channel > 0 {
+                luma_gain * self.latest_state[0].strength_solver.get_value(block_mean)
+            } else {
+                0f64
+            };
+            let corr = if channel > 0 {
+                let coeffs = &get_dbg(&self.latest_state, channel).eqns.x;
+                *get_dbg(coeffs, num_coords)
+            } else {
+                0f64
+            };
+            // Chroma noise:
+            //    N(0, noise_var) = N(0, uncorr_var) + corr * N(0, luma_strength^2)
+            // The uncorrelated component:
+            //   uncorr_var = noise_var - (corr * luma_strength)^2
+            // But don't allow fully correlated noise (hence the max), since the
+            // synthesis cannot model it.
+            let uncorr_std = (noise_var / 16f64)
+                .max((corr * luma_strength).mul_add(-(corr * luma_strength), noise_var))
+                .sqrt();
+            let adjusted_strength = uncorr_std / noise_gain;
+            get_dbg_mut(&mut self.latest_state, channel)
+                .strength_solver
+                .add_measurement(block_mean, adjusted_strength);
         }
     }
 }
@@ -1085,13 +1015,97 @@ struct BlockObservationJob<'a> {
     num_blocks_w: usize,
     sample_step: usize,
     frame_index: usize,
+    source: &'a Plane<u8>,
+    denoised: &'a Plane<u8>,
+    alt_source: Option<&'a Plane<u8>>,
 }
 
 impl BlockObservationJob<'_> {
+    /// Measures the mean and noise variance of each usable flat block. The model turns
+    /// these into strength measurements later, as that step depends on its state.
+    fn measure_block_noise(&self, num_blocks_h: usize) -> Vec<(f64, f64)> {
+        let (source, denoised, frame_dims) = (self.source, self.denoised, self.frame_dims);
+        let (block_w, block_h, num_blocks_w) = (self.block_w, self.block_h, self.num_blocks_w);
+        let mut block_noise = Vec::new();
+        for by in 0..num_blocks_h {
+            let y_o = by * block_h;
+            for bx in 0..num_blocks_w {
+                let x_o = bx * block_w;
+                if *get_dbg(self.flat_blocks, by * num_blocks_w + bx) == 0 {
+                    continue;
+                }
+                let num_samples_h = ((frame_dims.1
+                    / source.geometry().subsampling_y.get() as usize)
+                    - by * block_h)
+                    .min(block_h);
+                let num_samples_w = ((frame_dims.0
+                    / source.geometry().subsampling_x.get() as usize)
+                    - bx * block_w)
+                    .min(block_w);
+                // Make sure that we have a reasonable amount of samples to consider the
+                // block
+                if num_samples_w * num_samples_h > BLOCK_SIZE {
+                    let block_mean = get_block_mean(
+                        self.alt_source.unwrap_or(source),
+                        frame_dims,
+                        x_o << (source.geometry().subsampling_x.get() >> 1),
+                        y_o << (source.geometry().subsampling_y.get() >> 1),
+                    );
+                    let noise_var = get_noise_var(
+                        source,
+                        denoised,
+                        (
+                            frame_dims.0 >> (source.geometry().subsampling_x.get() >> 1),
+                            frame_dims.1 >> (source.geometry().subsampling_y.get() >> 1),
+                        ),
+                        x_o,
+                        y_o,
+                        block_w,
+                        block_h,
+                    );
+                    block_noise.push((block_mean, noise_var));
+                }
+            }
+        }
+        block_noise
+    }
+
     fn calculate(&self, start_by: usize, end_by: usize, worker: &mut ObservationWorker) {
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            // SAFETY: The CPU supports the features this function is compiled for.
+            unsafe { self.calculate_avx2_fma(start_by, end_by, worker) };
+            return;
+        }
+        // Without a hardware FMA the correction step is slower than dividing.
+        if cfg!(target_feature = "fma") || cfg!(target_arch = "aarch64") {
+            self.calculate_with(start_by, end_by, worker, normalize_with_fma);
+        } else {
+            self.calculate_with(start_by, end_by, worker, normalize_by_division);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn calculate_avx2_fma(
+        &self,
+        start_by: usize,
+        end_by: usize,
+        worker: &mut ObservationWorker,
+    ) {
+        self.calculate_with(start_by, end_by, worker, normalize_with_fma);
+    }
+
+    #[inline(always)]
+    fn calculate_with(
+        &self,
+        start_by: usize,
+        end_by: usize,
+        worker: &mut ObservationWorker,
+        normalize: impl Fn(f64) -> f64,
+    ) {
         let n = self.n;
-        // Avoid dividing every matrix contribution inside the pixel loop.
-        let inverse_normalization = 1.0 / BLOCK_NORMALIZATION.powi(2);
         let ObservationWorker {
             a,
             b,
@@ -1150,12 +1164,10 @@ impl BlockObservationJob<'_> {
                             );
                             for i in 0..n {
                                 for j in 0..=i {
-                                    let value = (*get_dbg(buffer, i) * *get_dbg(buffer, j))
-                                        * inverse_normalization;
-                                    *get_dbg_mut(a, i * n + j) += value;
+                                    *get_dbg_mut(a, i * n + j) +=
+                                        normalize(*get_dbg(buffer, i) * *get_dbg(buffer, j));
                                 }
-                                *get_dbg_mut(b, i) +=
-                                    (*get_dbg(buffer, i) * val) * inverse_normalization;
+                                *get_dbg_mut(b, i) += normalize(*get_dbg(buffer, i) * val);
                             }
                             *observations += 1;
                         }
@@ -1419,5 +1431,22 @@ impl Add<&StrengthSolver> for StrengthSolver {
 impl AddAssign<&StrengthSolver> for StrengthSolver {
     fn add_assign(&mut self, rhs: &StrengthSolver) {
         *self = self.clone() + rhs;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fma_normalization_matches_division() {
+        for sixteenths in -MAX_CONTRIBUTION_SIXTEENTHS..=MAX_CONTRIBUTION_SIXTEENTHS {
+            let contribution = f64::from(sixteenths) / 16.0;
+            assert_eq!(
+                normalize_with_fma(contribution).to_bits(),
+                normalize_by_division(contribution).to_bits(),
+                "contribution {contribution}"
+            );
+        }
     }
 }

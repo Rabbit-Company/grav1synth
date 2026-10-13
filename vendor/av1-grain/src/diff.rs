@@ -1,27 +1,27 @@
-use std::borrow::Cow;
+use std::{
+    borrow::Cow,
+    sync::{Condvar, Mutex, mpsc::sync_channel},
+};
 
 use anyhow::{Result, ensure};
 use num_rational::Rational64;
-use rayon::prelude::*;
 use v_frame::{frame::Frame, pixel::Pixel};
 
-use self::solver::{FlatBlockFinder, NoiseModel};
+use self::solver::{FrameObservations, FrameObserver, NoiseModel};
 use crate::{GrainTableSegment, util::frame_into_u8};
 
 mod solver;
 
 const BLOCK_SIZE: usize = 32;
 const BLOCK_SIZE_SQUARED: usize = BLOCK_SIZE * BLOCK_SIZE;
+/// How many finished frame results may wait for an earlier frame, per worker thread.
+const RESULTS_PER_THREAD: usize = 8;
 
 pub struct DiffGenerator {
-    fps: Rational64,
     source_bit_depth: usize,
     denoised_bit_depth: usize,
-    frame_count: usize,
-    prev_timestamp: u64,
-    flat_block_finder: FlatBlockFinder,
-    noise_model: NoiseModel,
-    grain_table: Vec<GrainTableSegment>,
+    observer: FrameObserver,
+    state: ModelState,
     threads: usize,
     sample_step: usize,
 }
@@ -56,12 +56,14 @@ impl DiffGenerator {
         sample_step: usize,
     ) -> Self {
         Self {
-            frame_count: 0,
-            fps,
-            flat_block_finder: FlatBlockFinder::new(),
-            noise_model: NoiseModel::new(),
-            grain_table: Vec::new(),
-            prev_timestamp: 0,
+            observer: FrameObserver::new(threads.max(1)),
+            state: ModelState {
+                fps,
+                frame_count: 0,
+                prev_timestamp: 0,
+                noise_model: NoiseModel::new(),
+                grain_table: Vec::new(),
+            },
             source_bit_depth,
             denoised_bit_depth,
             threads: threads.max(1),
@@ -81,22 +83,116 @@ impl DiffGenerator {
         source: &Frame<T>,
         denoised: &Frame<U>,
     ) -> Result<()> {
-        self.diff_frames_internal(&[(
-            &*frame_into_u8(source, self.source_bit_depth),
-            &*frame_into_u8(denoised, self.denoised_bit_depth),
-        )])
+        let source = frame_into_u8(source, self.source_bit_depth);
+        let denoised = frame_into_u8(denoised, self.denoised_bit_depth);
+        verify_dimensions_match(&source, &denoised)?;
+        let observations =
+            self.observer
+                .observe(&source, &denoised, self.sample_step, self.state.frame_count);
+        self.state.add_observed(&observations);
+        Ok(())
     }
 
-    /// Processes several consecutive frame pairs that are already 8-bit, see
-    /// [`frame_to_u8`]. The pairs are analyzed concurrently and then added to the
-    /// state in order, which gives the same result as one `diff_frame` call per pair.
+    /// Processes every frame pair the iterator yields and returns how many there were.
+    /// The frames must already be 8-bit, see [`frame_to_u8`]. `on_frame` runs after each
+    /// pair has been added.
+    ///
+    /// Worker threads analyze several pairs at once while this thread adds the finished
+    /// ones to the noise model in order. The result is the same as one `diff_frame` call
+    /// per pair.
     ///
     /// # Errors
+    /// - If the iterator yields an error
     /// - If the frames do not have the same resolution
     /// - If the frames do not have the same chroma subsampling
-    pub fn diff_frames(&mut self, pairs: &[(Frame<u8>, Frame<u8>)]) -> Result<()> {
-        let pairs: Vec<_> = pairs.iter().map(|(s, d)| (s, d)).collect();
-        self.diff_frames_internal(&pairs)
+    pub fn diff_frames<I>(&mut self, pairs: I, mut on_frame: impl FnMut()) -> Result<usize>
+    where
+        I: Iterator<Item = Result<(Frame<u8>, Frame<u8>)>> + Send,
+    {
+        let mut frames = 0usize;
+        let Some(pool) = self.observer.pool() else {
+            for pair in pairs {
+                let (source, denoised) = pair?;
+                verify_dimensions_match(&source, &denoised)?;
+                let observations = self.observer.observe(
+                    &source,
+                    &denoised,
+                    self.sample_step,
+                    self.state.frame_count,
+                );
+                self.state.add_observed(&observations);
+                frames += 1;
+                on_frame();
+            }
+            return Ok(frames);
+        };
+
+        // A frame's pixels are dropped once it has been analyzed, so only frames under
+        // analysis use much memory. Finished results are small and wait for their turn
+        // in a longer queue. A slow frame at the front then does not hold up the rest.
+        let analyzing = FrameLimit::new(self.threads);
+        let analyzing = &analyzing;
+        let window = self.threads * RESULTS_PER_THREAD;
+        let (observer, state) = (&self.observer, &mut self.state);
+        let (first_frame, sample_step) = (state.frame_count, self.sample_step);
+        let mut result = Ok(());
+        std::thread::scope(|threads| {
+            // Each pair gets a slot. The slots arrive in frame order and each one
+            // delivers its pair once the analysis has finished.
+            let (slot_sender, slot_receiver) = sync_channel(window);
+            threads.spawn(move || {
+                pool.in_place_scope(|scope| {
+                    for (index, pair) in pairs.enumerate() {
+                        let (sender, receiver) = sync_channel(1);
+                        if slot_sender.send(receiver).is_err() {
+                            break;
+                        }
+                        let pair = pair.and_then(|(source, denoised)| {
+                            verify_dimensions_match(&source, &denoised)?;
+                            Ok((source, denoised))
+                        });
+                        match pair {
+                            Ok((source, denoised)) => {
+                                let permit = analyzing.acquire();
+                                scope.spawn(move |_| {
+                                    let observations = observer.observe(
+                                        &source,
+                                        &denoised,
+                                        sample_step,
+                                        first_frame + index,
+                                    );
+                                    drop((source, denoised, permit));
+                                    let _ = sender.send(Ok(observations));
+                                });
+                            }
+                            Err(error) => {
+                                let _ = sender.send(Err(error));
+                                break;
+                            }
+                        }
+                    }
+                });
+            });
+
+            for slot in slot_receiver {
+                match slot.recv() {
+                    Ok(Ok(observations)) => {
+                        state.add_observed(&observations);
+                        frames += 1;
+                        on_frame();
+                    }
+                    Ok(Err(error)) => {
+                        result = Err(error);
+                        break;
+                    }
+                    Err(_) => {
+                        result = Err(anyhow::anyhow!("Grain analysis worker stopped early"));
+                        break;
+                    }
+                }
+            }
+        });
+        result.map(|()| frames)
     }
 
     /// Finalize the state of this `DiffGenerator` and return the resulting
@@ -105,72 +201,89 @@ impl DiffGenerator {
     #[inline]
     pub fn finish(mut self) -> Vec<GrainTableSegment> {
         log::debug!("Updating final parameters");
-        self.grain_table.push(
-            self.noise_model
-                .get_grain_parameters(self.prev_timestamp, i64::MAX as u64),
+        self.state.grain_table.push(
+            self.state
+                .noise_model
+                .get_grain_parameters(self.state.prev_timestamp, i64::MAX as u64),
         );
 
-        self.grain_table
+        self.state.grain_table
+    }
+}
+
+/// Limits how many frames are under analysis at once.
+struct FrameLimit {
+    available: Mutex<usize>,
+    released: Condvar,
+}
+
+impl FrameLimit {
+    const fn new(limit: usize) -> Self {
+        Self {
+            available: Mutex::new(limit),
+            released: Condvar::new(),
+        }
     }
 
-    fn diff_frames_internal(&mut self, pairs: &[(&Frame<u8>, &Frame<u8>)]) -> Result<()> {
-        // Frames before a mismatched pair are still processed, as with one call per pair.
-        let mismatch = pairs
-            .iter()
-            .enumerate()
-            .find_map(|(index, (s, d))| verify_dimensions_match(s, d).err().map(|e| (index, e)));
-        let pairs = mismatch
-            .as_ref()
-            .map_or(pairs, |(index, _)| &pairs[..*index]);
-
-        let pool_ready = self.noise_model.worker_pool(self.threads).is_some();
-        let first_frame = self.frame_count;
-        let (threads, sample_step) = (self.threads, self.sample_step);
-        let (finder, model) = (&self.flat_block_finder, &self.noise_model);
-        let observe = |(index, (source, denoised)): (usize, &(&Frame<u8>, &Frame<u8>))| {
-            model.observe(
-                finder,
-                source,
-                denoised,
-                threads,
-                sample_step,
-                first_frame + index,
-            )
-        };
-        let observations: Vec<_> = match model.pool() {
-            Some(pool) if pool_ready && pairs.len() > 1 => {
-                pool.install(|| pairs.par_iter().enumerate().map(observe).collect())
-            }
-            _ => pairs.iter().enumerate().map(observe).collect(),
-        };
-
-        for ((source, denoised), observations) in pairs.iter().zip(&observations) {
-            log::debug!("Num flat blocks: {}", observations.num_flat_blocks());
-
-            log::debug!("Updating noise model");
-            let status = self.noise_model.update(source, denoised, observations);
-
-            if status == NoiseStatus::DifferentType {
-                let cur_timestamp =
-                    self.frame_count as u64 * 10_000_000u64 * *self.fps.denom() as u64
-                        / *self.fps.numer() as u64;
-                log::debug!(
-                    "Updating parameters for times {} to {}",
-                    self.prev_timestamp,
-                    cur_timestamp
-                );
-                self.grain_table.push(
-                    self.noise_model
-                        .get_grain_parameters(self.prev_timestamp, cur_timestamp),
-                );
-                self.noise_model.save_latest();
-                self.prev_timestamp = cur_timestamp;
-            }
-            log::debug!("Noise model updated for frame {}", self.frame_count);
-            self.frame_count += 1;
+    /// Waits for a free place. Dropping the permit gives the place back.
+    fn acquire(&self) -> FramePermit<'_> {
+        let mut available = self.available.lock().expect("frame limit lock poisoned");
+        while *available == 0 {
+            available = self
+                .released
+                .wait(available)
+                .expect("frame limit lock poisoned");
         }
+        *available -= 1;
+        FramePermit(self)
+    }
+}
 
-        mismatch.map_or(Ok(()), |(_, error)| Err(error))
+struct FramePermit<'a>(&'a FrameLimit);
+
+impl Drop for FramePermit<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut available) = self.0.available.lock() {
+            *available += 1;
+        }
+        self.0.released.notify_one();
+    }
+}
+
+/// The frame-ordered part of the generator: the noise model and its output so far.
+struct ModelState {
+    fps: Rational64,
+    frame_count: usize,
+    prev_timestamp: u64,
+    noise_model: NoiseModel,
+    grain_table: Vec<GrainTableSegment>,
+}
+
+impl ModelState {
+    /// Adds the next frame to the noise model. Frames must be added in order.
+    fn add_observed(&mut self, observations: &FrameObservations) {
+        log::debug!("Num flat blocks: {}", observations.num_flat_blocks());
+
+        log::debug!("Updating noise model");
+        let status = self.noise_model.update(observations);
+
+        if status == NoiseStatus::DifferentType {
+            let cur_timestamp = self.frame_count as u64 * 10_000_000u64 * *self.fps.denom() as u64
+                / *self.fps.numer() as u64;
+            log::debug!(
+                "Updating parameters for times {} to {}",
+                self.prev_timestamp,
+                cur_timestamp
+            );
+            self.grain_table.push(
+                self.noise_model
+                    .get_grain_parameters(self.prev_timestamp, cur_timestamp),
+            );
+            self.noise_model.save_latest();
+            self.prev_timestamp = cur_timestamp;
+        }
+        log::debug!("Noise model updated for frame {}", self.frame_count);
+        self.frame_count += 1;
     }
 }
 
